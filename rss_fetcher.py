@@ -67,6 +67,10 @@ HIGH_PRIORITY_KEYWORDS = [
     "River Plate", "River",              # (short forms used in most headlines)
     "Transfer",                          # English transfer-window news
     "Fichaje", "Refuerzo",               # Spanish transfer-window equivalents
+    # Local Serbian + Brazilian stars (auto-published on breaking news)
+    "Radnicki", "Radnički",              # Radnički Kragujevac
+    "Vojvodina", "Voša",                 # Vojvodina Novi Sad
+    "Neymar", "Ronaldinho",              # Brazilian icons
 ]
 
 # Editorial breaking-news labels only ("BREAKING:", "BREAKING -", "Breaking news"),
