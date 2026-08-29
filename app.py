@@ -29,13 +29,15 @@ Run:
 """
 
 import html
+import json
 import os
-import random
 import re
 import socket
 import sqlite3
 import threading
 import time
+import urllib.parse
+import urllib.request
 from typing import Any
 
 import feedparser
@@ -56,10 +58,12 @@ DB_PATH = ":memory:"                        # RAM only - never touches the disk
 ADMIN_PATH = "/admin-tajna-kontrola-777"    # secret admin URL
 REFRESH_PATH = "/osvezi-vesti-777"          # secret "wake the robot" HTTP trigger
 
-TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "free")   # "free" | "ai"
+TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "ai")    # "ai" | "free"
 TARGET_LANGUAGE = "sr"
 MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 8))
-AUTOPILOT_PUBLISH_HIGH_PRIORITY = True
+# Full editorial control: NOTHING goes live automatically. Every translated
+# article lands in the admin "Na čekanju" queue and is published by hand.
+AUTOPILOT_PUBLISH_HIGH_PRIORITY = False
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", 600))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
 
@@ -91,9 +95,17 @@ SPORTS_FEEDS = [
     {"name": "Globo Esporte (Brazil)", "url": "https://ge.globo.com/dynamo/rss2.xml", "lang": "pt"},
 ]
 
+# ABSOLUTE priority (priority=2): an article mentioning Crvena zvezda always
+# claims the Hero ("Udarna vest") slot, ahead of any general foreign news.
+STAR_KEYWORDS = [
+    "Crvena zvezda", "Red Star", "Marakana", "Marakani", "Marakanu",
+    "Zvezda", "Zvezdini", "Zvezdine", "Zvezdin", "Zvezdu", "Zvezde",
+    "Zvezdi", "crveno-beli", "crveno-belim",
+]
+
 HIGH_PRIORITY_KEYWORDS = [
     "Messi", "Maradona", "Boca Juniors", "Boca", "River Plate", "River",
-    "Transfer", "Fichaje", "Refuerzo", "Crvena zvezda", "Zvezda", "Partizan",
+    "Transfer", "Fichaje", "Refuerzo", "Partizan",
     "Radnicki", "Radnički", "Vojvodina", "Voša", "Neymar", "Ronaldinho",
     "Jokic", "Jokić", "NBA", "champions", "Champions League",
 ]
@@ -224,6 +236,10 @@ def is_junk_sport(title: str, summary: str) -> bool:
 
 def calculate_priority(title: str, summary: str) -> int:
     text = f"{title or ''} {summary or ''}".lower()
+    # Absolute priority first: Zvezda news must always top the page.
+    for kw in STAR_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw.lower())}s?\b", text):
+            return 2
     for kw in HIGH_PRIORITY_KEYWORDS:
         if re.search(rf"\b{re.escape(kw.lower())}s?\b", text):
             return 1
@@ -316,8 +332,17 @@ def translate_text(text: str, is_headline: bool = False,
                    source_headline: str | None = None) -> str:
     if not text or not text.strip():
         return ""
+    # Preferred path: AI expands a short foreign brief into 2-3 Serbian
+    # journalistic paragraphs. If OPENAI_API_KEY is missing or the AI call
+    # fails for any reason, fall back to the free translator so the app
+    # never crashes.
     if TRANSLATION_MODE == "ai":
-        return localize_post(_translate_ai(text, is_headline, source_headline))
+        try:
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError("OPENAI_API_KEY nije podešen")
+            return localize_post(_translate_ai(text, is_headline, source_headline))
+        except Exception as exc:
+            print(f"[TRANSLATE][AI] otkaz, koristim free prevod: {exc}")
     return localize_post(_translate_free(localize_pre(text)))
 
 
@@ -351,9 +376,6 @@ def _translate_ai(text: str, is_headline: bool, source_headline: str | None) -> 
         raise RuntimeError("AI mode needs the 'openai' package: pip install openai") from exc
 
     key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("AI mode requires the OPENAI_API_KEY environment variable")
-
     client = OpenAI(api_key=key)
     prompt = AI_HEADLINE_SYSTEM_PROMPT if is_headline else AI_BODY_SYSTEM_PROMPT
     if is_headline:
@@ -555,27 +577,81 @@ _SOUTH_AMERICA_KEYWORDS = [
     "njujels", "ole", "clarin", "globo",
 ]
 
-PLACEHOLDER_IMAGES = {
-    "football": [
-        "https://images.unsplash.com/photo-1574629810360-7efbbe195018?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1522778119026-d647f0596c20?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1431324155629-1a6deb1dec8d?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1508098682722-e99c43a406b2?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1489944440615-453fc2b6a9a9?auto=format&fit=crop&w=1200&q=70",
-    ],
-    "basketball": [
-        "https://images.unsplash.com/photo-1546519638-68e109498ffc?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1519861531473-9200262188bf?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1574623452334-1e0ac2b3ccb4?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1608248543803-ba4f8c70ae0b?auto=format&fit=crop&w=1200&q=70",
-    ],
-    "general": [
-        "https://images.unsplash.com/photo-1517649763962-0c623066013b?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1461896836934-ffe607ba8211?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1521412644187-c49fa049e84d?auto=format&fit=crop&w=1200&q=70",
-        "https://images.unsplash.com/photo-1552674605-db6ffd4facb5?auto=format&fit=crop&w=1200&q=70",
-    ],
-}
+# Offline fallback images (inline SVG) used when Google Image Search is not
+# configured (no GOOGLE_API_KEY / GOOGLE_CX) or when the API call fails.
+_FALLBACK_EMOJI = {"football": "⚽", "basketball": "🏀", "general": "🏆"}
+
+
+def _fallback_image(category: str) -> str:
+    emoji = _FALLBACK_EMOJI.get(category, "🏆")
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='675' "
+        "viewBox='0 0 1200 675'>"
+        "<rect width='1200' height='675' fill='#1e293b'/>"
+        "<rect x='18' y='18' width='1164' height='639' rx='24' fill='none' "
+        "stroke='#334155' stroke-width='4'/>"
+        "<text x='600' y='380' font-size='230' text-anchor='middle'>"
+        f"{emoji}</text>"
+        "</svg>"
+    )
+    return "data:image/svg+xml;charset=utf-8," + urllib.parse.quote(svg)
+
+
+# Cache of Google image results keyed by article id (we never call the paid API
+# twice for the same article within a process, even on repeated page loads).
+_image_cache: dict[int, str] = {}
+_image_cache_lock = threading.Lock()
+
+
+def _google_image_url(query: str) -> str | None:
+    """Query Google Custom Search (image search) and return the first hit."""
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    cx = os.environ.get("GOOGLE_CX")
+    if not api_key or not cx:
+        return None
+    params = {
+        "key": api_key, "cx": cx, "q": query,
+        "searchType": "image", "num": 1, "safe": "active",
+        "imgSize": "large",
+    }
+    url = "https://www.googleapis.com/customsearch/v1?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode("utf-8", "ignore"))
+    items = data.get("items") or []
+    if items and items[0].get("link"):
+        return items[0]["link"]
+    return None
+
+
+def article_image(article) -> str:
+    """Real Google image for the article headline; offline SVG fallback."""
+    try:
+        article_id = article["id"]
+        title = article["translated_title"] or ""
+    except (KeyError, IndexError, TypeError):
+        article_id, title = None, ""
+    category = article_category(article)
+
+    with _image_cache_lock:
+        if article_id in _image_cache:
+            return _image_cache[article_id]
+
+    result = _fallback_image(category)
+    query = (title or category).strip()
+    try:
+        found = _google_image_url(query)
+        if found:
+            result = found
+    except Exception as exc:
+        print(f"[IMAGE] Google image search nije dostupan ({query[:40]}...): {exc}")
+
+    if article_id is not None:
+        with _image_cache_lock:
+            _image_cache[article_id] = result
+    return result
+
+
 CATEGORY_LABELS = {"football": "Fudbal", "basketball": "Košarka", "general": "Sport"}
 
 LOCAL_CLUBS = [
@@ -620,14 +696,6 @@ def is_south_america(article) -> bool:
     return any(re.search(rf"\b{re.escape(k)}", text) for k in _SOUTH_AMERICA_KEYWORDS)
 
 
-def article_image(article) -> str:
-    try:
-        seed = article["id"] or 0
-    except (KeyError, IndexError, TypeError):
-        seed = 0
-    return random.Random(f"img-{seed}").choice(PLACEHOLDER_IMAGES[article_category(article)])
-
-
 def category_label(article) -> str:
     return CATEGORY_LABELS[article_category(article)]
 
@@ -666,7 +734,7 @@ BASE_CSS = """
   --shadow:0 10px 30px rgba(2,6,23,.45);
 }
 *{box-sizing:border-box; margin:0; padding:0;}
-html{-webkit-text-size-adjust:100%;}
+html{-webkit-text-size-adjust:100%; scroll-behavior:smooth;}
 body{background:var(--bg); color:var(--text);
   font-family:'Segoe UI', system-ui, -apple-system, Roboto, sans-serif;
   line-height:1.6; min-height:100vh;}
@@ -678,13 +746,25 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
   gap:12px; padding:16px 0; flex-wrap:wrap;}
 .brand{display:flex; align-items:center; gap:10px; font-size:1.35rem; font-weight:800;}
 .brand .ball{font-size:1.5rem;} .brand em{font-style:normal; color:var(--green);}
-.topbar-tag{color:var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:2.5px;}
-.live-dot{display:inline-flex; align-items:center; gap:6px; color:var(--green);
-  font-size:.74rem; font-weight:700; letter-spacing:.5px; text-transform:uppercase;}
-.live-dot::before{content:''; width:8px; height:8px; border-radius:50%;
-  background:var(--green); box-shadow:0 0 10px var(--green);
-  animation:pulse 1.6s infinite;}
-@keyframes pulse{0%,100%{opacity:1;} 50%{opacity:.35;}}
+
+/* ---- hamburger navigation ---- */
+.site-nav{display:flex; align-items:center; gap:14px;}
+.hamburger{display:inline-flex; flex-direction:column; justify-content:center; gap:5px;
+  width:46px; height:46px; border:1px solid var(--border); border-radius:10px;
+  background:var(--panel); cursor:pointer; padding:0 11px;}
+.hamburger span{display:block; height:2px; width:100%; background:var(--text);
+  border-radius:2px; transition:transform .25s ease, opacity .25s ease;}
+.hamburger.open span:nth-child(1){transform:translateY(7px) rotate(45deg);}
+.hamburger.open span:nth-child(2){opacity:0;}
+.hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg);}
+.nav-dropdown{position:absolute; top:70px; right:20px; min-width:230px; z-index:40;
+  background:var(--panel); border:1px solid var(--border); border-radius:12px;
+  box-shadow:var(--shadow); padding:8px; display:none;}
+.nav-dropdown.show{display:block;}
+.nav-dropdown a{display:flex; align-items:center; gap:10px; padding:13px 16px;
+  border-radius:9px; font-weight:600; font-size:1rem; transition:background .15s;}
+.nav-dropdown a:hover{background:var(--panel-2); color:var(--green);}
+.nav-dropdown a .ico{font-size:1.2rem;}
 
 .chip{display:inline-block; background:rgba(15,23,42,.72); color:#e2e8f0;
   border:1px solid rgba(148,163,184,.35); border-radius:999px; padding:4px 12px;
@@ -696,6 +776,9 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .badge-live{display:inline-block; background:rgba(34,197,94,.15); color:#86efac;
   border:1px solid rgba(34,197,94,.4); border-radius:999px; padding:3px 11px;
   font-size:.7rem; font-weight:800; letter-spacing:.5px; text-transform:uppercase;}
+.badge-star{display:inline-block; background:linear-gradient(135deg,#dc2626,#b91c1c);
+  color:#fff; border-radius:999px; padding:4px 12px; font-size:.72rem; font-weight:800;
+  letter-spacing:.8px; text-transform:uppercase; box-shadow:0 0 18px rgba(220,38,38,.55);}
 
 .club-badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:2px;}
 .club-chip{display:inline-block; border-radius:6px; padding:3px 11px; font-size:.72rem;
@@ -727,7 +810,8 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .section-head h3 .emoji{margin-right:8px;}
 .sa-sub{font-size:.72rem; font-weight:600; color:var(--muted);
   text-transform:none; letter-spacing:.3px; white-space:nowrap;}
-.grid-section{margin-bottom:44px;}
+.grid-section{margin-bottom:44px; scroll-margin-top:88px;}
+.hero-head{scroll-margin-top:88px;}
 
 .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:24px;}
 .card{background:var(--panel); border:1px solid var(--border); border-radius:12px;
@@ -765,8 +849,7 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .views{margin-left:auto; font-weight:600;} .views b{color:var(--green);}
 .empty{background:var(--panel); border:1px dashed var(--border); border-radius:14px;
   color:var(--muted); text-align:center; padding:64px 24px; font-size:1.08rem;}
-.footer-text{color:var(--muted); font-size:.82rem; text-align:center; padding:34px 0 26px;}
-.foot-note{font-size:.72rem; color:var(--muted);}
+.footer-text{color:var(--muted); font-size:.88rem; text-align:center; padding:34px 0 26px;}
 
 /* ---- internal article reader ---- */
 .article-page{max-width:840px; margin:0 auto; padding:26px 20px 10px;}
@@ -868,6 +951,7 @@ PUBLIC_TEMPLATE = """
            loading="{{ 'eager' if eager else 'lazy' }}" onerror="this.style.opacity='0'">
       <span class="chip">{{ category_label(a) }}</span>
       {% if rank %}<span class="badge-trending">&#128293; Naj&#269;itanije</span>
+      {% elif a.priority == 2 %}<span class="badge-star">&#11088; Zvezda</span>
       {% elif a.priority == 1 %}<span class="badge-hot">&#9889;</span>{% endif %}
       {% if rank %}<span class="card-rank">{{ rank }}</span>{% endif %}
     </div>
@@ -891,8 +975,22 @@ PUBLIC_TEMPLATE = """
 
   <header class="topbar">
     <div class="container topbar-inner">
-      <div class="brand"><span class="ball">&#9917;</span>Sportski<em>Portal</em></div>
-      <span class="live-dot">U&#382;ivo &#8211; RAM baza</span>
+      <a class="brand" href="{{ url_for('index') }}"><span class="ball">&#9917;</span>Sportski<em>Portal</em></a>
+      <nav class="site-nav">
+        <button type="button" class="hamburger" id="hamburgerBtn"
+                aria-label="Meni" aria-expanded="false" aria-controls="navDropdown"
+                onclick="document.getElementById('navDropdown').classList.toggle('show');
+                         this.classList.toggle('open');
+                         this.setAttribute('aria-expanded', this.classList.contains('open'));">
+          <span></span><span></span><span></span>
+        </button>
+        <div class="nav-dropdown" id="navDropdown">
+          <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
+          <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
+          <a href="{{ url_for('index') }}#juzna-amerika" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#10024;</span> Ju&#382;na Amerika</a>
+          <a href="{{ url_for('index') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127968;</span> Po&#269;etna</a>
+        </div>
+      </nav>
     </div>
   </header>
 
@@ -909,7 +1007,8 @@ PUBLIC_TEMPLATE = """
         <div class="hero-overlay"></div>
         <div class="hero-content">
           <div class="hero-tags">
-            <span class="badge-hot">&#9889; Udarna vest</span>
+            {% if hero.priority == 2 %}<span class="badge-star">&#11088; Crvena zvezda &#8211; udarna vest</span>
+            {% else %}<span class="badge-hot">&#9889; Udarna vest</span>{% endif %}
             <span class="chip">{{ category_label(hero) }}</span>
             {% for club in club_badges(hero) %}<span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>{% endfor %}
             <span class="chip">&#128065; {{ hero.views or 0 }}</span>
@@ -932,21 +1031,21 @@ PUBLIC_TEMPLATE = """
       {% endif %}
 
       {% if football %}
-      <section class="grid-section">
+      <section class="grid-section" id="fudbal">
         <div class="section-head"><h3><span class="emoji">&#9917;</span>DOMA&#262;I TEREN &amp; EVROPSKI GIGANTI</h3><span class="line"></span></div>
         <div class="grid">{% for a in football %}{{ card(a) }}{% endfor %}</div>
       </section>
       {% endif %}
 
       {% if basketball %}
-      <section class="grid-section">
+      <section class="grid-section" id="kosarka">
         <div class="section-head"><h3><span class="emoji">&#127936;</span>KO&#352;ARKA</h3><span class="line"></span></div>
         <div class="grid">{% for a in basketball %}{{ card(a) }}{% endfor %}</div>
       </section>
       {% endif %}
 
       {% if south_america %}
-      <section class="grid-section">
+      <section class="grid-section" id="juzna-amerika">
         <div class="section-head"><h3><span class="emoji">&#10024;</span>JU&#381;NOAMERI&#268;KA MAGIJA <span class="sa-sub">(Gau&#269;osi i Karijoke)</span></h3><span class="line"></span></div>
         <div class="grid">{% for a in south_america %}{{ card(a) }}{% endfor %}</div>
       </section>
@@ -960,9 +1059,7 @@ PUBLIC_TEMPLATE = """
   </main>
 
   <footer class="container footer-text">
-    Sportski Portal &#8211; diskless autopilot (SQLite :memory: + background thread)<br>
-    <span class="foot-note">Podaci su u RAM-u i osve&#382;avaju se svakih {{ interval }}s;
-    restart procesa ponovo puni bazu sa RSS feedova.</span>
+    &copy; 2026 Sportski Portal. Sva prava zadr&#382;ana.
   </footer>
 </body>
 </html>
@@ -980,7 +1077,21 @@ ARTICLE_DETAIL_TEMPLATE = """
   <header class="topbar">
     <div class="container topbar-inner">
       <a class="brand" href="{{ url_for('index') }}"><span class="ball">&#9917;</span>Sportski<em>Portal</em></a>
-      <span class="live-dot">U&#382;ivo &#8211; RAM baza</span>
+      <nav class="site-nav">
+        <button type="button" class="hamburger" id="hamburgerBtn"
+                aria-label="Meni" aria-expanded="false" aria-controls="navDropdown"
+                onclick="document.getElementById('navDropdown').classList.toggle('show');
+                         this.classList.toggle('open');
+                         this.setAttribute('aria-expanded', this.classList.contains('open'));">
+          <span></span><span></span><span></span>
+        </button>
+        <div class="nav-dropdown" id="navDropdown">
+          <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
+          <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
+          <a href="{{ url_for('index') }}#juzna-amerika" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#10024;</span> Ju&#382;na Amerika</a>
+          <a href="{{ url_for('index') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127968;</span> Po&#269;etna</a>
+        </div>
+      </nav>
     </div>
   </header>
 
@@ -993,7 +1104,8 @@ ARTICLE_DETAIL_TEMPLATE = """
       <div class="article-inner">
         <div class="article-tags">
           <span class="chip">{{ category_label(a) }}</span>
-          {% if a.priority == 1 %}<span class="badge-hot">&#9889; Udarna vest</span>{% endif %}
+          {% if a.priority == 2 %}<span class="badge-star">&#11088; Crvena zvezda</span>
+          {% elif a.priority == 1 %}<span class="badge-hot">&#9889; Udarna vest</span>{% endif %}
           {% for club in club_badges(a) %}<span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>{% endfor %}
         </div>
 
@@ -1076,7 +1188,7 @@ ADMIN_TEMPLATE = """
             {% for a in pending %}
             <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
                href="{{ url_for('admin', article_id=a['id']) }}">
-              <div class="pi-title">{{ a.translated_title }}{% if a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
+              <div class="pi-title">{{ a.translated_title }}{% if a.priority == 2 %} <span class="badge-star">&#11088;</span>{% elif a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
               <div class="pi-meta meta">{{ a.source }}</div>
             </a>
             {% endfor %}
@@ -1168,7 +1280,11 @@ def index():
                ORDER BY published_date DESC, id DESC"""
         ).fetchall()
 
-        hero = next((a for a in articles if a["priority"] == 1), None)
+        # Hero: absolute-priority Zvezda news (priority=2) always wins; then
+        # ordinary high-priority (priority=1). Articles are already ordered by
+        # newest first, so the first match is also the freshest of its tier.
+        hero = next((a for a in articles if a["priority"] == 2), None) or \
+            next((a for a in articles if a["priority"] == 1), None)
         hero_id = hero["id"] if hero else None
 
         trending = sorted(
@@ -1187,8 +1303,7 @@ def index():
 
     return render_template_string(
         PUBLIC_TEMPLATE, hero=hero, trending=trending, football=football,
-        basketball=basketball, south_america=south_america,
-        interval=FETCH_INTERVAL_SECONDS, css=BASE_CSS,
+        basketball=basketball, south_america=south_america, css=BASE_CSS,
     )
 
 
