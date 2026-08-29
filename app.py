@@ -58,9 +58,15 @@ _FOOTBALL_KEYWORDS = [
     "ofšajd", "napad", "odbrana",
     # Local Serbian clubs / slang (Superliga)
     "radnicki", "radnički", "radničkog", "radničkom", "radnički 1923",
+    "radnicki kragujevac", "radnički kragujevac",
     "kragujevac", "kragujevcu", "vojvodina", "vojvodine", "vojvodini",
-    "vosa", "voša", "voše", "cika daca", "čika dača",
+    "vojvodinom", "vosa", "voša", "voše", "cika daca", "čika dača",
     "đavoli", "davoli", "superliga", "novosađani", "novosadjani",
+    "novosađana",
+    # Radnički Niš
+    "radnicki nis", "radnički niš", "radnički iz niša", "nišava", "čair",
+    # FK Novi Pazar
+    "novi pazar", "novog pazara", "novom pazaru", "novim pazarom", "pazarci",
     # Brazilian stars / clubs
     "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao", "estêvão",
     "messinho", "flamengo", "palmeiras", "santos",
@@ -163,11 +169,89 @@ def category_label(article) -> str:
     return CATEGORY_LABELS[article_category(article)]
 
 
+# --------------------------------------------------------------------------- #
+# Local club color badges (dynamic, attached in the card body)
+# --------------------------------------------------------------------------- #
+
+# (label, css-class, distinctive matchers). Distinctive club signals are listed
+# first so they beat the shared "Radnički" word; the Radnički label alone is
+# only attributed when a city signal disambiguates it.
+LOCAL_CLUBS = [
+    {
+        "label": "Radnički KG",
+        "css": "club-kg",
+        "match": [
+            "kragujevac", "kragujevcu", "kragujevca", "čika dača", "cika daca",
+            "đavoli", "davoli",
+        ],
+    },
+    {
+        "label": "Radnički Niš",
+        "css": "club-nis",
+        "match": ["radnički niš", "radnicki nis", "čair", "nišava"],
+    },
+    {
+        "label": "Novi Pazar",
+        "css": "club-pazar",
+        "match": [
+            "novi pazar", "novog pazara", "novom pazaru", "novim pazarom",
+            "pazarci",
+        ],
+    },
+    {
+        "label": "Vojvodina",
+        "css": "club-vosa",
+        "match": [
+            "vojvodina", "vojvodine", "vojvodini", "vojvodinom",
+            "voša", "vosa", "voše", "novosađani", "novosadjani", "novosađana",
+        ],
+    },
+]
+
+# Signal for a bare Radnički reference in a Niš context. Matched with a START
+# boundary only so inflected forms (u Nišu, Niša, Nišom) still match; the 'š'
+# is kept to avoid false positives such as the common word 'nismo'.
+_NIS_CONTEXT = ["niš", "čair", "nišava"]
+
+
+def club_badges(article) -> list[dict]:
+    """
+    Scan the article text and return every local Superliga club it clearly
+    refers to, each as {'label': ..., 'css': ...}. Radnički (KG vs Niš) is
+    attributed only with a disambiguating city signal, so a bare 'Radnički'
+    never gets a mis-colored badge.
+    """
+    text = article_text_blob(article)
+    badges: list[dict] = []
+    labels: set[str] = set()
+
+    for club in LOCAL_CLUBS:
+        if any(signal in text for signal in club["match"]):
+            if club["label"] not in labels:
+                badges.append({"label": club["label"], "css": club["css"]})
+                labels.add(club["label"])
+
+    # Bare "Radnički" + a Niš context word but no KG signal -> it's Niš
+    has_radnicki = re.search(r"\bradni[čc]ki\b", text) is not None
+    has_kg = any(b["label"] == "Radnički KG" for b in badges)
+    has_nis = any(b["label"] == "Radnički Niš" for b in badges)
+    if (
+        has_radnicki
+        and not has_kg
+        and not has_nis
+        and any(re.search(rf"\b{re.escape(w)}", text) for w in _NIS_CONTEXT)
+    ):
+        badges.append({"label": "Radnički Niš", "css": "club-nis"})
+
+    return badges
+
+
 # Expose the helpers to Jinja templates
 app.jinja_env.globals.update(
     article_image=article_image,
     article_category=article_category,
     category_label=category_label,
+    club_badges=club_badges,
 )
 
 
@@ -273,6 +357,18 @@ img{display:block; max-width:100%;}
   letter-spacing:.8px; text-transform:uppercase; white-space:nowrap;
   box-shadow:0 0 18px rgba(34,197,94,.5);
 }
+
+/* ---------- Local-club color chips (dynamic, in card body) ---------- */
+.club-badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:2px;}
+.club-chip{
+  display:inline-block; border-radius:6px; padding:3px 11px;
+  font-size:.72rem; font-weight:800; letter-spacing:.5px; white-space:nowrap;
+  text-transform:uppercase; border:1px solid transparent;
+}
+.club-kg   {background:#dc2626; color:#fff; border-color:#f87171;}  /* Radnički KG - red */
+.club-nis  {background:#f97316; color:#1f1300; border-color:#fb923c;}  /* Radnički Niš - orange */
+.club-pazar{background:#2563eb; color:#fff; border-color:#60a5fa;}  /* Novi Pazar - blue */
+.club-vosa {background:#e2e8f0; color:#0f172a; border-color:#cbd5e1;}  /* Vojvodina - white/gray */
 
 /* ---------- Hero article ---------- */
 .hero{
@@ -501,6 +597,14 @@ PUBLIC_TEMPLATE = """
     </div>
     <div class="card-body">
       <h4>{{ a.translated_title }}</h4>
+      {% set clubs = club_badges(a) %}
+      {% if clubs %}
+      <div class="club-badges">
+        {% for club in clubs %}
+        <span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
       <p class="card-excerpt">{{ a.translated_summary }}</p>
       <div class="meta">
         <span>&#128240; {{ a.source }}</span>
@@ -537,6 +641,9 @@ PUBLIC_TEMPLATE = """
           <div class="hero-tags">
             <span class="badge-hot">&#9889; Udarna vest</span>
             <span class="chip">{{ category_label(hero) }}</span>
+            {% for club in club_badges(hero) %}
+            <span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>
+            {% endfor %}
             <span class="chip">&#128065; {{ hero.views or 0 }}</span>
           </div>
           <h2>{{ hero.translated_title }}</h2>
