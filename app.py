@@ -177,6 +177,8 @@ CREATE TABLE IF NOT EXISTS articles (
     priority           INTEGER NOT NULL DEFAULT 0,
     status             TEXT    NOT NULL DEFAULT 'pending'
                                         CHECK (status IN ('pending','published')),
+    position           TEXT    NOT NULL DEFAULT 'standard'
+                                        CHECK (position IN ('hero','trending','standard')),
     views              INTEGER NOT NULL DEFAULT 0
 )
 """
@@ -185,6 +187,12 @@ CREATE TABLE IF NOT EXISTS articles (
 def init_db() -> None:
     with _db_lock:
         _db.execute(SCHEMA_SQL)
+        # Lightweight migration for any pre-existing table without `position`.
+        cols = {row[1] for row in _db.execute("PRAGMA table_info(articles)")}
+        if "position" not in cols:
+            _db.execute(
+                "ALTER TABLE articles ADD COLUMN position "
+                "TEXT NOT NULL DEFAULT 'standard'")
         _db.commit()
 
 
@@ -452,7 +460,7 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
             """SELECT id, source, original_title, original_summary, priority, source_lang
                FROM articles
                WHERE translated_title = '' AND translated_summary = ''
-               ORDER BY priority DESC, published_date DESC
+               ORDER BY published_date DESC, id DESC
                LIMIT ?""",
             (limit,),
         ).fetchall()
@@ -465,9 +473,21 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
         article_id = row["id"]
         try:
             if row["source_lang"] == "sr":
-                # Already Serbian -> use as-is, only normalize club names locally.
-                tr_title = localize_post(row["original_title"])
-                tr_summary = localize_post(row["original_summary"]) if row["original_summary"] else ""
+                # Ako je TRANSLATION_MODE postavljen na "ai", šaljemo i domaću
+                # vest na proširivanje u 2-3 pasusa (naslov ostaje izvoran).
+                if TRANSLATION_MODE == "ai" and os.environ.get("OPENAI_API_KEY"):
+                    tr_title = localize_post(row["original_title"])
+                    # Ugrađeni AI novinar od jedne domaće rečenice pravi ceo članak.
+                    tr_summary = translate_text(
+                        row["original_summary"], is_headline=False,
+                        source_headline=row["original_title"])
+                else:
+                    # Već na srpskom -> prikaži direktno, samo lokalno srediti imena.
+                    tr_title = localize_post(row["original_title"])
+                    tr_summary = (
+                        localize_post(row["original_summary"])
+                        if row["original_summary"] else ""
+                    )
             else:
                 tr_title = translate_text(row["original_title"], is_headline=True,
                                           source_headline=row["original_title"])
@@ -916,6 +936,19 @@ form input[type=text], form textarea{width:100%; background:var(--bg); color:var
 form input[type=text]:focus, form textarea:focus{outline:none; border-color:var(--green);
   box-shadow:0 0 0 3px rgba(34,197,94,.15);}
 form textarea{resize:vertical; min-height:160px;}
+.pos-options{display:flex; flex-direction:column; gap:10px; margin-top:8px;}
+.pos-opt{display:flex; align-items:center; gap:12px; background:var(--bg);
+  border:1px solid var(--border); border-radius:10px; padding:12px 14px;
+  cursor:pointer; text-transform:none; letter-spacing:normal; margin:0;
+  transition:border-color .15s, background .15s;}
+.pos-opt:hover{border-color:var(--green);}
+.pos-opt input{width:auto; margin:0; accent-color:var(--green); cursor:pointer;}
+.pos-opt:has(input:checked){border-color:var(--green);
+  background:rgba(34,197,94,.1); box-shadow:0 0 0 2px rgba(34,197,94,.12);}
+.pos-ico{font-size:1.4rem; line-height:1;}
+.pos-text{display:flex; flex-direction:column; gap:2px;}
+.pos-text b{font-size:.98rem; color:var(--text);}
+.pos-text small{color:var(--muted); font-size:.78rem; font-weight:500;}
 .actions{display:flex; gap:12px; margin-top:18px; flex-wrap:wrap;}
 .sel-status{margin-left:auto;}
 
@@ -1235,6 +1268,29 @@ ADMIN_TEMPLATE = """
           <input type="text" id="title" name="translated_title" value="{{ selected.translated_title }}" required>
           <label for="summary">Sa&#382;etak / &#269;lanak (srpski)</label>
           <textarea id="summary" name="translated_summary" rows="10" required>{{ selected.translated_summary }}</textarea>
+
+          <label>Pozicija na naslovnoj strani</label>
+          <div class="pos-options">
+            <label class="pos-opt">
+              <input type="radio" name="position" value="hero"
+                     {{ 'checked' if selected.position == 'hero' else '' }}>
+              <span class="pos-ico">&#9889;</span>
+              <span class="pos-text"><b>Udarna vest / Hero</b><small>Velika gornja sekcija (samo jedna)</small></span>
+            </label>
+            <label class="pos-opt">
+              <input type="radio" name="position" value="trending"
+                     {{ 'checked' if selected.position == 'trending' else '' }}>
+              <span class="pos-ico">&#128293;</span>
+              <span class="pos-text"><b>Naj&#269;itanije / Trending</b><small>Traka sa tri istaknute vesti</small></span>
+            </label>
+            <label class="pos-opt">
+              <input type="radio" name="position" value="standard"
+                     {{ 'checked' if selected.position not in ('hero','trending') else '' }}>
+              <span class="pos-ico">&#9917;</span>
+              <span class="pos-text"><b>Standardna kartica</b><small>Raspore&#273;uje se po kategoriji</small></span>
+            </label>
+          </div>
+
           <div class="actions">
             {% if selected.status == 'published' %}
               <button type="submit" class="btn btn-green">&#128190; Sa&#269;uvaj izmene (ostaje u&#382;ivo)</button>
@@ -1275,23 +1331,34 @@ def index():
     with _db_lock:
         articles = db.execute(
             """SELECT id, source, original_title, original_summary, link,
-                      translated_title, translated_summary, published_date, priority, views
+                      translated_title, translated_summary, published_date,
+                      priority, position, views
                FROM articles WHERE status='published'
                ORDER BY published_date DESC, id DESC"""
         ).fetchall()
 
-        # Hero: absolute-priority Zvezda news (priority=2) always wins; then
-        # ordinary high-priority (priority=1). Articles are already ordered by
-        # newest first, so the first match is also the freshest of its tier.
-        hero = next((a for a in articles if a["priority"] == 2), None) or \
-            next((a for a in articles if a["priority"] == 1), None)
+        # --- Hero: ONLY the article the editor set to position='hero' ---
+        hero = next((a for a in articles if a["position"] == "hero"), None)
+        # Fallback (nothing placed yet): freshest Zvezda (p=2), then high (p=1).
+        if hero is None:
+            hero = next((a for a in articles if a["priority"] == 2), None) or \
+                next((a for a in articles if a["priority"] == 1), None)
         hero_id = hero["id"] if hero else None
 
-        trending = sorted(
-            (a for a in articles if a["id"] != hero_id),
+        # --- Trending: editor-picked position='trending' (max 3) ---
+        picked_trending = [a for a in articles
+                           if a["position"] == "trending" and a["id"] != hero_id][:3]
+        used = {a["id"] for a in picked_trending}
+        if hero_id is not None:
+            used.add(hero_id)
+        remaining = [a for a in articles if a["id"] not in used]
+        # Fill up to 3 with most-viewed articles if fewer than 3 were picked.
+        auto_trending = sorted(
+            remaining,
             key=lambda a: (a["views"] or 0, a["published_date"] or "", a["id"]),
             reverse=True,
-        )[:3]
+        )[:max(0, 3 - len(picked_trending))]
+        trending = picked_trending + auto_trending
 
         featured_ids = ({hero_id} if hero_id is not None else set()) | {a["id"] for a in trending}
         rest = [a for a in articles if a["id"] not in featured_ids]
@@ -1379,16 +1446,27 @@ def admin():
 def publish_article(article_id: int):
     title = (request.form.get("translated_title") or "").strip()
     summary = (request.form.get("translated_summary") or "").strip()
+    position = (request.form.get("position") or "standard").strip()
+    if position not in ("hero", "trending", "standard"):
+        position = "standard"
     if not title or not summary:
         flash("Naslov i sa&#382;etak ne smeju biti prazni.")
         return redirect(url_for("admin", article_id=article_id))
     db = get_db()
     with _db_lock:
+        # Only ONE hero may exist: demote the current hero when a new one is set.
+        if position == "hero":
+            db.execute(
+                "UPDATE articles SET position='standard' "
+                "WHERE position='hero' AND id != ?", (article_id,))
         db.execute(
-            """UPDATE articles SET translated_title=?, translated_summary=?, status='published'
-               WHERE id=?""", (title, summary, article_id))
+            """UPDATE articles
+               SET translated_title=?, translated_summary=?,
+                   status='published', position=?
+               WHERE id=?""",
+            (title, summary, position, article_id))
         db.commit()
-    flash(f"Vest #{article_id} je sa&#269;uvana i objavljena.")
+    flash(f"Vest #{article_id} je sa&#269;uvana, objavljena i pozicionirana ({position}).")
     return redirect(url_for("admin", article_id=article_id))
 
 
