@@ -26,6 +26,9 @@ Env vars (all optional):
     MAX_TRANSLATIONS_PER_RUN default 8 per cycle
     FETCH_INTERVAL_SECONDS   autopilot loop interval (default 600)
     RUN_FETCHER              "0" to disable the background fetcher
+    AUTOPILOT_PUBLISH        "1" (default) auto-publishes every translated
+                             article live; "0" holds everything in the admin
+                             "Na čekanju" queue for manual approval.
 
 No AI SDK is needed: Gemini is called over plain HTTPS with urllib.
 
@@ -73,9 +76,12 @@ GEMINI_API_URL = (
     "{model}:generateContent?key={key}"
 )
 MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 8))
-# Full editorial control: NOTHING goes live automatically. Every translated
-# article lands in the admin "Na čekanju" queue and is published by hand.
-AUTOPILOT_PUBLISH_HIGH_PRIORITY = False
+# AUTOMATIC publishing: every successfully translated article goes live on its
+# own as a 'standard' card. Placement still follows the priority criteria
+# (Zvezda p=2 -> hero, etc.) and the admin panel ALWAYS stays available so any
+# live article can be edited, repositioned (hero/trending) or deleted by hand.
+# Set AUTOPILOT_PUBLISH=0 to fall back to full manual approval (Na čekanju queue).
+AUTOPILOT_PUBLISH = os.environ.get("AUTOPILOT_PUBLISH", "1") != "0"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", 600))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
 
@@ -547,17 +553,27 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
                                    source_headline=row["original_title"])
                     if ai_body_material else ""
                 )
-            status = (
-                "published"
-                if (AUTOPILOT_PUBLISH_HIGH_PRIORITY and row["priority"] == 1)
-                else "pending"
-            )
+            # AUTOMATIC publishing: every translated article goes live. A
+            # Zvezda (priority=2) article auto-claims the Hero slot and demotes
+            # the previous hero; everything else lands as a standard card.
+            # With AUTOPILOT_PUBLISH=0 everything stays 'pending' for approval.
+            if AUTOPILOT_PUBLISH:
+                status = "published"
+                position = "hero" if row["priority"] == 2 else "standard"
+            else:
+                status, position = "pending", "standard"
+
             with _db_lock:
+                if position == "hero":
+                    _db.execute(
+                        "UPDATE articles SET position='standard' "
+                        "WHERE position='hero' AND id != ?", (article_id,))
                 _db.execute(
                     """UPDATE articles
-                       SET translated_title = ?, translated_summary = ?, status = ?
+                       SET translated_title = ?, translated_summary = ?,
+                           status = ?, position = ?
                        WHERE id = ?""",
-                    (tr_title, tr_summary, status, article_id),
+                    (tr_title, tr_summary, status, position, article_id),
                 )
                 _db.commit()
             translated += 1
