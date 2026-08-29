@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# Sports News Aggregator - Python dependencies
+# Install with:  pip install -r requirements.txt
+# Python 3.10+ recommended (developed on 3.13)
+# ---------------------------------------------------------------------------
+
+# Web server + admin dashboard (app.py)
+Flask==3.1.3
+
+# RSS feed fetching & parsing (rss_fetcher.py)
+feedparser==6.0.14
+
+# Free translation mode - Google Translate backend (TRANSLATION_MODE="free")
+deep-translator==1.11.4
+
+# Optional: AI article generation mode (TRANSLATION_MODE="ai")
+# Only needed if you set TRANSLATION_MODE="ai"; requires the
+# OPENAI_API_KEY environment variable. Safe to leave installed.
+openai==3.6.0
