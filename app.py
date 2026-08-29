@@ -18,10 +18,16 @@ Trade-off: RAM is volatile, so the DB reseeds from RSS on every process start.
 Env vars (all optional):
     SECRET_KEY               Flask secret (set in production!)
     PORT                     HTTP port (default 5000)
-    TRANSLATION_MODE         "free" (default) or "ai"
+    TRANSLATION_MODE         "ai" (default, uses Gemini) or "free" (Google translate)
+    GEMINI_API_KEY           Google AI Studio key -> full 2-3 paragraph articles.
+                             If missing/unset, the app safely falls back to free.
+    GEMINI_MODEL             Gemini model (default "gemini-2.5-flash")
+    GOOGLE_API_KEY/GOOGLE_CX optional Google image search (real photos).
     MAX_TRANSLATIONS_PER_RUN default 8 per cycle
     FETCH_INTERVAL_SECONDS   autopilot loop interval (default 600)
     RUN_FETCHER              "0" to disable the background fetcher
+
+No AI SDK is needed: Gemini is called over plain HTTPS with urllib.
 
 Run:
     pip install -r requirements.txt
@@ -60,6 +66,12 @@ REFRESH_PATH = "/osvezi-vesti-777"          # secret "wake the robot" HTTP trigg
 
 TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "ai")    # "ai" | "free"
 TARGET_LANGUAGE = "sr"
+# Google AI Studio (Gemini) free tier. No external SDK needed - plain HTTPS call.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent?key={key}"
+)
 MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 8))
 # Full editorial control: NOTHING goes live automatically. Every translated
 # article lands in the admin "Na čekanju" queue and is published by hand.
@@ -133,7 +145,7 @@ _db.row_factory = sqlite3.Row
 
 
 # --------------------------------------------------------------------------- #
-# AI prompts (used only when TRANSLATION_MODE == "ai", needs OPENAI_API_KEY)
+# AI prompts (used only when TRANSLATION_MODE == "ai", needs GEMINI_API_KEY)
 # --------------------------------------------------------------------------- #
 
 AI_HEADLINE_SYSTEM_PROMPT = (
@@ -340,14 +352,13 @@ def translate_text(text: str, is_headline: bool = False,
                    source_headline: str | None = None) -> str:
     if not text or not text.strip():
         return ""
-    # Preferred path: AI expands a short foreign brief into 2-3 Serbian
-    # journalistic paragraphs. If OPENAI_API_KEY is missing or the AI call
-    # fails for any reason, fall back to the free translator so the app
-    # never crashes.
+    # Preferred path: Gemini expands a short foreign brief into 2-3 Serbian
+    # journalistic paragraphs. If GEMINI_API_KEY is missing or the call fails
+    # for any reason, fall back to the free translator so the app never crashes.
     if TRANSLATION_MODE == "ai":
         try:
-            if not os.environ.get("OPENAI_API_KEY"):
-                raise RuntimeError("OPENAI_API_KEY nije podešen")
+            if not os.environ.get("GEMINI_API_KEY"):
+                raise RuntimeError("GEMINI_API_KEY nije podešen")
             return localize_post(_translate_ai(text, is_headline, source_headline))
         except Exception as exc:
             print(f"[TRANSLATE][AI] otkaz, koristim free prevod: {exc}")
@@ -378,27 +389,60 @@ def _looks_like_error_page(text: str) -> bool:
 
 
 def _translate_ai(text: str, is_headline: bool, source_headline: str | None) -> str:
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("AI mode needs the 'openai' package: pip install openai") from exc
+    """Call Google Gemini (AI Studio free tier) over plain HTTPS - no SDK.
 
-    key = os.environ.get("OPENAI_API_KEY")
-    client = OpenAI(api_key=key)
+    Returns Serbian text (headline = translated title; body = 2-3 paragraph
+    article). Raises on any failure so translate_text() can fall back to free.
+    """
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("AI mode zahteva GEMINI_API_KEY environment varijablu")
+
     prompt = AI_HEADLINE_SYSTEM_PROMPT if is_headline else AI_BODY_SYSTEM_PROMPT
     if is_headline:
         user = f"Headline:\n{text}"
-        temp, tokens = 0.7, 200
+        tokens = 200
     else:
         user = f"Headline:\n{source_headline or ''}\n\nNews brief:\n{text}"
-        temp, tokens = 0.7, 900
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": prompt},
-                  {"role": "user", "content": f"Target language: {TARGET_LANGUAGE}\n\n{user}"}],
-        temperature=temp, max_tokens=tokens,
+        tokens = 1200
+
+    payload = {
+        "system_instruction": {"parts": [{"text": prompt}]},
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": f"Target language: {TARGET_LANGUAGE}\n\n{user}"}],
+        }],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": tokens,
+            # gemini-2.5-flash: disable internal "thinking" for fast, cheap output
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+        # Don't let sports content (hard tackles, derbies) trip the safety filter.
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
+    }
+
+    url = GEMINI_API_URL.format(model=GEMINI_MODEL, key=urllib.parse.quote(key))
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
     )
-    return resp.choices[0].message.content.strip()
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        data = json.loads(resp.read().decode("utf-8", "ignore"))
+
+    candidate = (data.get("candidates") or [{}])[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    result = "".join(p.get("text", "") for p in parts).strip()
+    if not result:
+        reason = (data.get("promptFeedback", {}) or {}).get("blockReason") \
+            or candidate.get("finishReason") or "prazan odgovor"
+        raise RuntimeError(f"Gemini nije vratio tekst ({reason})")
+    return result
 
 
 # ---------- Fetch / store cycle ---------- #
@@ -475,7 +519,7 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
             if row["source_lang"] == "sr":
                 # Ako je TRANSLATION_MODE postavljen na "ai", šaljemo i domaću
                 # vest na proširivanje u 2-3 pasusa (naslov ostaje izvoran).
-                if TRANSLATION_MODE == "ai" and os.environ.get("OPENAI_API_KEY"):
+                if TRANSLATION_MODE == "ai" and os.environ.get("GEMINI_API_KEY"):
                     tr_title = localize_post(row["original_title"])
                     # Ugrađeni AI novinar od jedne domaće rečenice pravi ceo članak.
                     tr_summary = translate_text(
