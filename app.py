@@ -926,6 +926,32 @@ def track_click(article_id: int):
     return redirect(url_for("index"))
 
 
+@app.route("/osvezi-vesti-777")
+def rucno_osvezi_vesti_iz_rama():
+    """
+    Ruta za ručno forsiranje RSS fetcher-a i prevodioca na Render Free okruženju.
+    Slanjem HTTP GET zahteva, Render izvršava ciklus unutar glavne niti zahteva,
+    čime se sprečava gašenje procesa i puni volatile :memory: baza podataka.
+    """
+    try:
+        print("[MANUAL FETCH] Pokretanje ručnog osvežavanja vesti kroz HTTP zahtev...")
+        run_fetcher_cycle()
+        with _db_lock:
+            total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()["c"]
+            live = _db.execute(
+                "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()["c"]
+        return (
+            "<h3>Uspeh!</h3>"
+            "<p>Robot je ručno pokrenut i RAM baza je upravo osvežena novim sportskim vestima.</p>"
+            f"<p>Ukupno u bazi: <b>{total}</b> &mdash; objavljeno (uživo): <b>{live}</b>.</p>"
+            "<p><a href='/'>Vrati se na početnu stranicu</a> ili idi na <a href='"
+            + ADMIN_PATH + "'>Admin Panel</a>.</p>"
+        )
+    except Exception as e:
+        print(f"[MANUAL FETCH][ERROR] Greška prilikom ručnog osvežavanja: {e}")
+        return f"<h3>Greška prilikom buđenja robota:</h3><p>{e}</p>", 500
+
+
 @app.route(ADMIN_PATH)
 def admin():
     db = get_db()
