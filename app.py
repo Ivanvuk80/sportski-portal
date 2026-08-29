@@ -2,21 +2,18 @@
 Sports News Aggregator - Single-file, diskless, self-updating build.
 
 Everything runs from THIS file:
-  * Flask web portal + secret admin dashboard (app.py)
-  * RSS fetcher / priority engine / translation engine (rss_fetcher.py)
+  * Flask web portal + secret admin dashboard + internal article reader
+  * RSS fetcher / per-article junk filter / sports localization / translation
 
 Key deployment choices:
-  * DATABASE_PATH = ":memory:"  -> the SQLite database lives in RAM and never
-    touches the disk. Because an in-memory SQLite DB is scoped to a single
-    connection, we open ONE shared connection (check_same_thread=False) and
-    guard every access with a global re-entrant lock so the web request
-    threads and the background fetcher thread share the same data safely.
-  * The fetcher runs on a BACKGROUND THREAD on an autopilot loop, so the app is
-    completely self-contained: start it and the site fills with live articles.
+  * DATABASE_PATH = ":memory:"  -> SQLite lives in RAM and never touches disk.
+    One shared connection (check_same_thread=False) guarded by a global RLock so
+    the web request threads and the background fetcher thread share data safely.
+  * The fetcher runs on a BACKGROUND THREAD (autopilot). A secret HTTP route
+    (/osvezi-vesti-777) also forces a cycle inside the request thread, which is
+    the reliable way to refill the volatile DB on Render Free.
 
-  Trade-off: RAM is volatile, so the in-memory DB is seeded fresh on each
-  process start (and each serverless "cold start"). Perfect for stateless /
-  ephemeral deployments; use a file/Postgres when you need persistence.
+Trade-off: RAM is volatile, so the DB reseeds from RSS on every process start.
 
 Env vars (all optional):
     SECRET_KEY               Flask secret (set in production!)
@@ -42,9 +39,9 @@ import time
 from typing import Any
 
 import feedparser
-from flask import Flask, g, flash, redirect, render_template_string, request, url_for
+from flask import Flask, flash, redirect, render_template_string, request, url_for
 
-try:  # free translation mode (deep-translator) is required for the autopilot
+try:  # free translation mode (deep-translator)
     from deep_translator import GoogleTranslator
 except ImportError:  # pragma: no cover
     GoogleTranslator = None
@@ -55,8 +52,9 @@ socket.setdefaulttimeout(15)
 # Configuration
 # --------------------------------------------------------------------------- #
 
-DB_PATH = ":memory:"                       # RAM only - never touches the disk
-ADMIN_PATH = "/admin-tajna-kontrola-777"   # secret admin URL
+DB_PATH = ":memory:"                        # RAM only - never touches the disk
+ADMIN_PATH = "/admin-tajna-kontrola-777"    # secret admin URL
+REFRESH_PATH = "/osvezi-vesti-777"          # secret "wake the robot" HTTP trigger
 
 TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "free")   # "free" | "ai"
 TARGET_LANGUAGE = "sr"
@@ -65,23 +63,48 @@ AUTOPILOT_PUBLISH_HIGH_PRIORITY = True
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", 600))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
 
+# Full browser User-Agent so foreign CDNs/servers do not block our requests.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+# Feeds with "lang": "sr" are already in Serbian -> shown directly, never sent
+# through the translator (avoids garbling club names). Every URL below was
+# live-tested to actually return articles (homepage URLs return 0 in feedparser).
 SPORTS_FEEDS = [
-    {"name": "BBC Sport", "url": "https://feeds.bbci.co.uk/sport/rss.xml"},
-    {"name": "Ole (Argentina)", "url": "https://www.ole.com.ar/rss/"},
-    {"name": "Clarin Deportes (Argentina)", "url": "https://www.clarin.com/rss/deportes/"},
+    # DOMAĆI TEREN - profesionalne domaće redakcije (već na srpskom)
+    {"name": "Sportski žurnal", "url": "http://www.zurnal.rs/rss", "lang": "sr"},
+    {"name": "Telegraf Sport", "url": "https://www.telegraf.rs/rss/sport", "lang": "sr"},
+    # EVROPSKI GIGANTI (La Liga, Serija A, Premijer liga, Liga šampiona, transferi)
+    {"name": "Marca (Španija)", "url": "https://e00-marca.uecdn.es/rss/futbol.xml", "lang": "es"},
+    {"name": "AS (Španija)", "url": "https://as.com/rss/futbol/portada.xml", "lang": "es"},
+    {"name": "Gazzetta (Italija)", "url": "https://www.gazzetta.it/rss/calcio.xml", "lang": "it"},
+    {"name": "Sky Sports (Engleska)", "url": "https://www.skysports.com/rss/12040", "lang": "en"},
+    {"name": "Football Italia", "url": "https://football-italia.net/feed/", "lang": "en"},
+    # KOŠARKA (NBA + Evroliga)
+    {"name": "Eurohoops", "url": "https://www.eurohoops.net/feed/", "lang": "en"},
+    {"name": "Sportando", "url": "https://sportando.basketball/en/feed/", "lang": "en"},
+    # JUŽNOAMERIČKA MAGIJA (Argentina + Brazil)
+    {"name": "Olé (Argentina)", "url": "https://www.ole.com.ar/rss/", "lang": "es"},
+    {"name": "Clarín (Argentina)", "url": "https://www.clarin.com/rss/deportes/", "lang": "es"},
+    {"name": "Globo Esporte (Brazil)", "url": "https://ge.globo.com/dynamo/rss2.xml", "lang": "pt"},
 ]
 
 HIGH_PRIORITY_KEYWORDS = [
     "Messi", "Maradona", "Boca Juniors", "Boca", "River Plate", "River",
-    "Transfer", "Fichaje", "Refuerzo",
+    "Transfer", "Fichaje", "Refuerzo", "Crvena zvezda", "Zvezda", "Partizan",
     "Radnicki", "Radnički", "Vojvodina", "Voša", "Neymar", "Ronaldinho",
+    "Jokic", "Jokić", "NBA", "champions", "Champions League",
 ]
 
+# A SINGLE article carrying one of these is skipped (never the whole feed/site).
 JUNK_SPORT_WORDS = [
-    "triathlon", "cricket", "rugby", "golf", "snooker", "triatlon", "kriket",
+    "triathlon", "triatlon", "cricket", "kriket", "críquet", "críquete",
+    "rugby", "ragbi", "rúgbi", "golf", "snooker", "snuker",
 ]
 
-BREAKING_NEWS_PATTERN = r"\bbreaking(?:\s*[:-]|\s+news\b)"
+BREAKING_NEWS_PATTERN = r"\bbreaking(?:\s*[:-]|\\s+news\b)"
 FREE_MAX_RETRIES = 3
 TRANSLATION_ERROR_MARKERS = (
     "error 500", "server error", "that’s an error", "that's an error",
@@ -103,21 +126,24 @@ _db.row_factory = sqlite3.Row
 
 AI_HEADLINE_SYSTEM_PROMPT = (
     "You are a senior Serbian sports journalist and SEO copywriter. "
-    "Translate the Spanish/English sports headline to Serbian, convert foreign "
-    "football slang into localized Serbian sports terminology, and rewrite the "
-    "headline to be unique and catchy for SEO. Preserve all key facts. "
+    "Translate the Spanish/English/Italian/Portuguese sports headline to Serbian, "
+    "convert foreign football slang into localized Serbian sports terminology, and "
+    "rewrite the headline to be unique and catchy for SEO. Preserve all key facts. "
+    "Use these club names exactly: Crvena zvezda, Partizan, River Plejt, "
+    "Boka Juniors, Njuels Old Bojs, Radnički Kragujevac. "
     "Output ONLY the Serbian headline."
 )
 
 AI_BODY_SYSTEM_PROMPT = (
     "You are a senior sports journalist writing for a major Serbian sports "
     "portal (Mozzart Sport / Sportal / Arena Sport style). Given a short RSS "
-    "news brief plus its headline in Spanish or English: 1) Translate to Serbian "
-    "and EXPAND it into a full, engaging, professional article of 2-3 detailed "
-    "paragraphs (~150 words). 2) Open with a strong journalistic lead, then add "
-    "context (key moment, stakes, standings) and a closing outlook. 3) Localize "
-    "football slang into natural Serbian terminology. 4) Never invent facts not "
-    "in the brief. 5) Output ONLY the article body, no headline or preamble."
+    "news brief plus its headline in Spanish, English, Italian or Portuguese: "
+    "1) Translate to Serbian and EXPAND it into a full, engaging, professional "
+    "article of 2-3 detailed paragraphs (~150 words). 2) Open with a strong "
+    "journalistic lead, add context and a closing outlook. 3) Localize football "
+    "slang into natural Serbian terminology. 4) Use these club names exactly: "
+    "Crvena zvezda, Partizan, River Plejt, Boka Juniors, Njuels Old Bojs, "
+    "Radnički Kragujevac. 5) Never invent facts. 6) Output ONLY the article body."
 )
 
 
@@ -135,6 +161,7 @@ CREATE TABLE IF NOT EXISTS articles (
     published_date     TEXT,
     translated_title   TEXT    NOT NULL DEFAULT '',
     translated_summary TEXT    NOT NULL DEFAULT '',
+    source_lang        TEXT    NOT NULL DEFAULT 'auto',
     priority           INTEGER NOT NULL DEFAULT 0,
     status             TEXT    NOT NULL DEFAULT 'pending'
                                         CHECK (status IN ('pending','published')),
@@ -150,10 +177,7 @@ def init_db() -> None:
 
 
 def get_db() -> sqlite3.Connection:
-    """
-    All threads (Flask workers + background fetcher) share the SAME in-memory
-    connection; the RLock serializes access. There is no per-request close().
-    """
+    """All threads share the SAME in-memory connection; the RLock serializes."""
     return _db
 
 
@@ -192,16 +216,98 @@ def parse_entry(entry: Any, source: str) -> dict:
     }
 
 
+def is_junk_sport(title: str, summary: str) -> bool:
+    """True if THIS SINGLE article is about a sport we don't cover."""
+    text = f"{title or ''} {summary or ''}".lower()
+    return any(re.search(rf"\b{re.escape(w)}\b", text) for w in JUNK_SPORT_WORDS)
+
+
 def calculate_priority(title: str, summary: str) -> int:
     text = f"{title or ''} {summary or ''}".lower()
-    if any(re.search(rf"\b{re.escape(w)}\b", text) for w in JUNK_SPORT_WORDS):
-        return 0
     for kw in HIGH_PRIORITY_KEYWORDS:
         if re.search(rf"\b{re.escape(kw.lower())}s?\b", text):
             return 1
     if re.search(BREAKING_NEWS_PATTERN, text):
         return 1
     return 0
+
+
+# ---------- Sports localization (prevents funny literal translations) ------ #
+
+# Applied to the ORIGINAL source text BEFORE translation: we drop the already
+# correct Serbian name in, so the translator keeps it instead of literally
+# translating ("Red Star" -> stays "Crvena zvezda").
+LOCALIZE_PRE = [
+    (r"newell'?s\s+old\s+boys", "Njuels Old Bojs"),
+    (r"partizan\s+belgrade", "Partizan"),
+    (r"red\s+star(?:\s+belgrade)?", "Crvena zvezda"),
+    (r"river\s+plate", "River Plejt"),
+    (r"boca\s+juniors", "Boka Juniors"),
+    (r"transfer\s+window", "Prelazni rok"),
+    (r"transfer\s+market", "Fudbalska pijaca"),
+]
+
+# Applied to the FINISHED Serbian text: cleans up any leftover English and the
+# famous machine-translation blunders (River Plate -> "Bela kuća"/"Srebrna reka").
+LOCALIZE_POST = [
+    (r"red\s+star(?:\s+belgrade)?", "Crvena zvezda"),
+    (r"partizan\s+belgrade", "Partizan"),
+    (r"(?:reka\s+je\s+)?b(?:ij|e)l(?:a|e|u)\s+ku(?:ć|c)[aćehu]", "River Plejt"),
+    (r"srebrna\s+reka", "River Plejt"),
+    (r"river\s*plate?", "River Plejt"),
+    (r"boca\s+juniors", "Boka Juniors"),
+    (r"newell'?s\s+old\s+boys", "Njuels Old Bojs"),
+]
+
+_KRAGUJEVAC_CONTEXT = ["kragujevc", "čika dač", "cika dac", "đavol", "davol"]
+
+# Serbian is phonetic and 1:1 between scripts. Google often returns Cyrillic;
+# we normalise every Serbian output to Latin so the club-name post-filters
+# (written in Latin) always match and the whole site stays a uniform script.
+_CYR_TO_LAT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "ђ": "đ", "е": "e",
+    "ж": "ž", "з": "z", "и": "i", "ј": "j", "к": "k", "л": "l", "љ": "lj",
+    "м": "m", "н": "n", "њ": "nj", "о": "o", "п": "p", "р": "r", "с": "s",
+    "т": "t", "ћ": "ć", "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "č",
+    "џ": "dž", "ш": "š",
+    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Ђ": "Đ", "Е": "E",
+    "Ж": "Ž", "З": "Z", "И": "I", "Ј": "J", "К": "K", "Л": "L", "Љ": "Lj",
+    "М": "M", "Н": "N", "Њ": "Nj", "О": "O", "П": "P", "Р": "R", "С": "S",
+    "Т": "T", "Ћ": "Ć", "У": "U", "Ф": "F", "Х": "H", "Ц": "C", "Ч": "Č",
+    "Џ": "Dž", "Ш": "Š",
+}
+
+
+def to_latin(text: str) -> str:
+    return "".join(_CYR_TO_LAT.get(ch, ch) for ch in (text or ""))
+
+
+def _apply_map(text: str, rules: list[tuple[str, str]]) -> str:
+    for pattern, replacement in rules:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def localize_pre(text: str) -> str:
+    return _apply_map(text or "", LOCALIZE_PRE)
+
+
+def localize_post(text: str) -> str:
+    """Fix Serbian output: normalise to Latin, fix club names, force 'Radnički
+    Kragujevac' in context."""
+    text = to_latin(text or "")
+    text = _apply_map(text, LOCALIZE_POST)
+    low = text.lower()
+    if any(ctx in low for ctx in _KRAGUJEVAC_CONTEXT):
+        # Bare nominative "Radnički" in a Kragujevac context must read
+        # "Radnički Kragujevac". The trailing \b protects genitive/dative forms
+        # ("Radničkog", "Radničkom") already present in domestic Serbian text;
+        # the lookahead avoids re-appending when the city/year is already there.
+        text = re.sub(
+            r"\bRadni[čc]ki(?!\s+(?:Kragujevac|Ni[šs]|1923))\b",
+            "Radnički Kragujevac", text,
+        )
+    return text
 
 
 # ---------- Translation engine ---------- #
@@ -211,8 +317,8 @@ def translate_text(text: str, is_headline: bool = False,
     if not text or not text.strip():
         return ""
     if TRANSLATION_MODE == "ai":
-        return _translate_ai(text, is_headline, source_headline)
-    return _translate_free(text)
+        return localize_post(_translate_ai(text, is_headline, source_headline))
+    return localize_post(_translate_free(localize_pre(text)))
 
 
 def _translate_free(text: str) -> str:
@@ -244,8 +350,7 @@ def _translate_ai(text: str, is_headline: bool, source_headline: str | None) -> 
     except ImportError as exc:
         raise RuntimeError("AI mode needs the 'openai' package: pip install openai") from exc
 
-    import os as _os
-    key = _os.environ.get("OPENAI_API_KEY")
+    key = os.environ.get("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("AI mode requires the OPENAI_API_KEY environment variable")
 
@@ -269,20 +374,25 @@ def _translate_ai(text: str, is_headline: bool, source_headline: str | None) -> 
 # ---------- Fetch / store cycle ---------- #
 
 def fetch_all_feeds() -> tuple[int, int]:
-    """Pull every feed, dedupe by link, store new articles. Returns (new, skipped)."""
+    """Pull every feed, dedupe by link, skip junk per-article. Returns (new, skipped)."""
     new = skipped = 0
     for feed in SPORTS_FEEDS:
-        source, url = feed["name"], feed["url"]
+        source, url, lang = feed["name"], feed["url"], feed.get("lang", "auto")
         try:
-            parsed = feedparser.parse(url, agent="SportsAggregator/1.0")
+            parsed = feedparser.parse(url, agent=BROWSER_UA)
             if parsed.bozo and not parsed.entries:
-                raise parsed.bozo_exception or RuntimeError("Feed returned no entries")
+                raise parsed.bozo_exception or RuntimeError("Feed vratio 0 vesti")
 
             batch = []          # build rows WITHOUT holding the lock across the network
             for entry in parsed.entries:
                 art = parse_entry(entry, source)
                 if not art["link"]:
                     continue
+                if is_junk_sport(art["title"], art["summary"]):
+                    skipped += 1                 # drop ONLY this single article
+                    continue
+                art["priority"] = calculate_priority(art["title"], art["summary"])
+                art["lang"] = lang
                 batch.append(art)
 
             with _db_lock:
@@ -293,28 +403,31 @@ def fetch_all_feeds() -> tuple[int, int]:
                     if exists:
                         skipped += 1
                         continue
-                    art["priority"] = calculate_priority(art["title"], art["summary"])
                     _db.execute(
                         """INSERT INTO articles
                            (source, original_title, original_summary, link,
-                            published_date, priority, status)
-                           VALUES (?,?,?,?,?,?, 'pending')""",
+                            published_date, source_lang, priority, status)
+                           VALUES (?,?,?,?,?,?,?, 'pending')""",
                         (art["source"], art["title"], art["summary"], art["link"],
-                         art["published"], art["priority"]),
+                         art["published"], art["lang"], art["priority"]),
                     )
                     new += 1
                 _db.commit()
-            print(f"[FETCH] {source}: batch ok")
+            print(f"[FETCH] {source}: batch ok ({len(batch)} u obzir)")
         except Exception as exc:
             print(f"[FETCH][ERROR] {source}: {exc}")
     return new, skipped
 
 
 def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, int]:
-    """Translate/generate up to `limit` pending articles; autopilot-publish hot ones."""
+    """Translate/generate up to `limit` pending articles; autopilot-publish hot ones.
+
+    Serbian-source articles are copied through directly (no network call) so club
+    names are never mangled.
+    """
     with _db_lock:
         rows = _db.execute(
-            """SELECT id, source, original_title, original_summary, priority
+            """SELECT id, source, original_title, original_summary, priority, source_lang
                FROM articles
                WHERE translated_title = '' AND translated_summary = ''
                ORDER BY priority DESC, published_date DESC
@@ -329,13 +442,18 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
     for row in rows:
         article_id = row["id"]
         try:
-            tr_title = translate_text(row["original_title"], is_headline=True,
-                                      source_headline=row["original_title"])
-            tr_summary = (
-                translate_text(row["original_summary"], is_headline=False,
-                               source_headline=row["original_title"])
-                if row["original_summary"] else ""
-            )
+            if row["source_lang"] == "sr":
+                # Already Serbian -> use as-is, only normalize club names locally.
+                tr_title = localize_post(row["original_title"])
+                tr_summary = localize_post(row["original_summary"]) if row["original_summary"] else ""
+            else:
+                tr_title = translate_text(row["original_title"], is_headline=True,
+                                          source_headline=row["original_title"])
+                tr_summary = (
+                    translate_text(row["original_summary"], is_headline=False,
+                                   source_headline=row["original_title"])
+                    if row["original_summary"] else ""
+                )
             status = (
                 "published"
                 if (AUTOPILOT_PUBLISH_HIGH_PRIORITY and row["priority"] == 1)
@@ -351,9 +469,8 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
                 _db.commit()
             translated += 1
             tag = "PUBLISHED" if status == "published" else "pending"
-            print(f"[TRANSLATE] #{article_id} [{row['source']}] {tag}: "
-                  f"{tr_title[:60]}")
-            if TRANSLATION_MODE == "free":
+            print(f"[TRANSLATE] #{article_id} [{row['source']}] {tag}: {tr_title[:60]}")
+            if row["source_lang"] != "sr" and TRANSLATION_MODE == "free":
                 time.sleep(0.5)
         except Exception as exc:
             failed += 1
@@ -366,10 +483,10 @@ def run_fetcher_cycle() -> None:
     new, skipped = fetch_all_feeds()
     process_translations()
     with _db_lock:
-        total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()["c"]
+        total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()[0]
         live = _db.execute(
-            "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()["c"]
-    print(f"[AUTOPILOT] cycle: {new} new, {skipped} dupes | DB {total} | live {live}")
+            "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()[0]
+    print(f"[AUTOPILOT] cycle: {new} new, {skipped} skipped/dupes | DB {total} | live {live}")
 
 
 def _fetcher_loop() -> None:
@@ -399,38 +516,43 @@ def start_background_fetcher() -> None:
 
 _BASKETBALL_KEYWORDS = [
     "nba", "jokic", "jokić", "basketball", "košarka", "kosarka",
-    "košarkašk", "kosarkask", "basket",
+    "košarkašk", "kosarkask", "košarkaš", "kosarkas", "basket",
+    "evroliga", "evrolige", "euroleague", "euroleague", "evrokup",
 ]
 _FOOTBALL_KEYWORDS = [
     "football", "soccer", "fudbal", "fudbalsk", "messi", "maradona",
-    "boca juniors", "boca", "xeneize", "river plate", "river", "lanus",
-    "lanús", "velez", "vélez", "real madrid", "liverpool", "barselona",
-    "barcelona", "psg", "fichaje", "refuerzo", "transfer", "gol",
-    "utakmica", "meč", "premier league", "la liga", "clausura",
-    "libertadores", "golman", "kapiten", "trener", "derbi", "prelazni rok",
-    "ofšajd", "napad", "odbrana",
+    "boca juniors", "boka juniors", "boka", "river plej t", "river plej",
+    "plejt", "xeneize", "river plate", "lanus", "lanús", "velez", "vélez",
+    "real madrid", "liverpool", "barselona", "barcelona", "psg", "fichaje",
+    "refuerzo", "transfer", "gol", "utakmica", "meč", "premier league",
+    "la liga", "serija a", "clausura", "klauzura", "libertadores",
+    "sudamericana", "golman", "kapiten", "trener", "derbi", "prelazni rok",
+    "fudbalska pijaca", "ofšajd", "napad", "odbrana",
     "radnicki", "radnički", "radničkog", "radničkom", "radnički 1923",
-    "radnicki kragujevac", "radnički kragujevac",
-    "kragujevac", "kragujevcu", "vojvodina", "vojvodine", "vojvodini",
-    "vojvodinom", "vosa", "voša", "voše", "cika daca", "čika dača",
-    "đavoli", "davoli", "superliga", "novosađani", "novosadjani", "novosađana",
-    "radnicki nis", "radnički niš", "radnički iz niša", "nišava", "čair",
-    "novi pazar", "novog pazara", "novom pazaru", "novim pazarom", "pazarci",
+    "radnicki kragujevac", "radnički kragujevac", "crvena zvezda", "zvezda",
+    "partizan", "kragujevac", "kragujevcu", "vojvodina", "vojvodine",
+    "vojvodini", "vojvodinom", "vosa", "voša", "voše", "cika daca",
+    "čika dača", "đavoli", "davoli", "superliga", "novosađani",
+    "novosadjani", "novosađana", "radnicki nis", "radnički niš",
+    "radnički iz niša", "nišava", "čair", "novi pazar", "novog pazara",
+    "novom pazaru", "novim pazarom", "pazarci",
     "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao", "estêvão",
     "messinho", "flamengo", "palmeiras", "santos",
     "sao paulo", "são paulo", "fluminense",
 ]
 _SOUTH_AMERICA_KEYWORDS = [
-    "boca", "river", "xeneize", "millonario", "nuñeza", "nunjeza",
-    "boca juniors", "river plate", "lanús", "lanus", "vélez", "velez",
-    "racing", "independiente", "san lorenzo", "estudiantes",
-    "bombonera", "clausura", "libertadores", "sudamericana", "gaucho", "gaučo",
-    "messi", "maradona", "tevez", "riquelme", "gallardo", "arruabarrena",
-    "arrubarena", "ponzio", "belmonte",
-    "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao", "estêvão",
-    "messinho", "flamengo", "palmeiras", "santos",
+    "boka", "boca", "river plej", "plejt", "xeneize", "millonario",
+    "boca juniors", "boka juniors", "river plate", "lanús", "lanus",
+    "vélez", "velez", "racing", "independiente", "san lorenzo",
+    "estudiantes", "bombonera", "clausura", "klauzura", "libertadores",
+    "sudamericana", "gaucho", "gaučo", "gaučos", "karioka", "karioke",
+    "tango", "samba", "argentina", "argentinski", "brazil", "brazilu",
+    "brazilski", "brazilskom",
+    "messi", "maradona", "tevez", "riquelme", "gallardo",
+    "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao",
+    "estêvão", "messinho", "flamengo", "palmeiras", "santos",
     "sao paulo", "são paulo", "fluminense", "brasileirao", "brasileirão",
-    "carioca", "carioka",
+    "njujels", "ole", "clarin", "globo",
 ]
 
 PLACEHOLDER_IMAGES = {
@@ -459,7 +581,7 @@ CATEGORY_LABELS = {"football": "Fudbal", "basketball": "Košarka", "general": "S
 LOCAL_CLUBS = [
     {"label": "Radnički KG", "css": "club-kg",
      "match": ["kragujevac", "kragujevcu", "kragujevca", "čika dača",
-               "cika daca", "đavoli", "davoli"]},
+               "cika daca", "đavoli", "davoli", "radnički kragujevac"]},
     {"label": "Radnički Niš", "css": "club-nis",
      "match": ["radnički niš", "radnicki nis", "čair", "nišava"]},
     {"label": "Novi Pazar", "css": "club-pazar",
@@ -571,6 +693,9 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .badge-hot{display:inline-block; background:var(--green); color:#052e16;
   border-radius:999px; padding:4px 12px; font-size:.72rem; font-weight:800;
   letter-spacing:.8px; text-transform:uppercase; box-shadow:0 0 18px rgba(34,197,94,.5);}
+.badge-live{display:inline-block; background:rgba(34,197,94,.15); color:#86efac;
+  border:1px solid rgba(34,197,94,.4); border-radius:999px; padding:3px 11px;
+  font-size:.7rem; font-weight:800; letter-spacing:.5px; text-transform:uppercase;}
 
 .club-badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:2px;}
 .club-chip{display:inline-block; border-radius:6px; padding:3px 11px; font-size:.72rem;
@@ -643,11 +768,36 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .footer-text{color:var(--muted); font-size:.82rem; text-align:center; padding:34px 0 26px;}
 .foot-note{font-size:.72rem; color:var(--muted);}
 
+/* ---- internal article reader ---- */
+.article-page{max-width:840px; margin:0 auto; padding:26px 20px 10px;}
+.back-link{display:inline-flex; align-items:center; gap:7px; margin-bottom:22px;
+  color:var(--green); font-weight:700; font-size:.95rem;}
+.back-link:hover{text-decoration:underline;}
+.article-card{background:var(--panel); border:1px solid var(--border); border-radius:16px;
+  overflow:hidden; box-shadow:var(--shadow);}
+.article-cover{width:100%; aspect-ratio:16/9; object-fit:cover; background:var(--panel-2);}
+.article-inner{padding:28px 32px 34px;}
+.article-tags{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px;}
+.article-title{font-size:clamp(1.5rem,3.2vw,2.3rem); font-weight:800; line-height:1.2;
+  margin-bottom:14px; text-shadow:0 2px 12px rgba(0,0,0,.4);}
+.article-meta{margin-bottom:22px; padding-bottom:18px; border-bottom:1px solid var(--border);}
+.article-body{font-size:1.08rem; line-height:1.9; color:#dbe4f0;}
+.article-body p{margin-bottom:18px;}
+.source-note{margin-top:30px; background:var(--panel-2); border:1px solid var(--border);
+  border-left:4px solid var(--green); border-radius:10px; padding:16px 20px;
+  font-size:.98rem; color:#cbd5e1;}
+.source-note a{color:var(--green); font-weight:800; text-decoration:underline;}
+.notfound{max-width:560px; margin:70px auto; text-align:center;}
+
 .btn{display:inline-block; border:none; border-radius:9px; padding:11px 20px;
   font-size:.92rem; font-weight:600; cursor:pointer; text-align:center;
   transition:background .15s, color .15s, border-color .15s;}
 .btn-green{background:var(--green); color:#052e16;} .btn-green:hover{background:var(--green-dark); color:#fff;}
 .btn-red{background:transparent; color:var(--red); border:1px solid var(--red);} .btn-red:hover{background:var(--red); color:#fff;}
+.btn-red.big{display:block; width:100%; padding:15px 22px; font-size:1.05rem; font-weight:800;
+  letter-spacing:.5px; text-transform:uppercase; margin-top:16px;
+  background:var(--red-dark); color:#fff; border-color:var(--red);}
+.btn-red.big:hover{background:var(--red);}
 .btn-ghost{background:transparent; color:var(--muted); border:1px solid var(--border);} .btn-ghost:hover{color:var(--text); border-color:var(--muted);}
 .flash{background:rgba(34,197,94,.12); border:1px solid var(--green); color:#bbf7d0;
   border-radius:10px; padding:12px 16px; margin-bottom:18px; font-size:.92rem;}
@@ -655,7 +805,12 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .admin-wrap{display:flex; gap:20px; align-items:flex-start; margin-top:20px;}
 .panel{background:var(--panel); border:1px solid var(--border); border-radius:12px;}
 .admin-list{width:38%; max-height:calc(100vh - 160px); overflow-y:auto; padding:10px;}
+.admin-group{margin-bottom:6px;}
 .admin-review{width:62%; padding:22px; position:sticky; top:96px;}
+.group-head{font-size:.78rem; font-weight:800; letter-spacing:1.2px; text-transform:uppercase;
+  padding:10px 10px 8px; position:sticky; top:0; background:var(--panel); z-index:2;}
+.group-head.pending{color:#fbbf24;}
+.group-head.published{color:var(--green); border-bottom:1px solid var(--border); margin-bottom:4px;}
 .panel-head{font-size:.78rem; font-weight:700; letter-spacing:1.5px; text-transform:uppercase;
   color:var(--muted); padding:8px 10px 12px; border-bottom:1px solid var(--border); margin-bottom:10px;}
 .admin-review .panel-head{margin:0 0 16px; padding:0 0 12px;}
@@ -664,7 +819,8 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .pending-item:hover{background:var(--panel-2);}
 .pending-item.active{background:var(--panel-2); border-color:var(--green);}
 .pi-title{font-weight:600; font-size:.95rem; line-height:1.35; margin-bottom:4px;}
-.empty-small{color:var(--muted); font-size:.9rem; padding:14px;}
+.pi-meta{display:flex; gap:8px; align-items:center;}
+.empty-small{color:var(--muted); font-size:.9rem; padding:10px 12px 14px;}
 .orig-ref{background:var(--panel-2); border:1px solid var(--border); border-radius:10px;
   padding:14px 16px; margin-bottom:18px; font-size:.9rem;}
 .orig-label{color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;}
@@ -678,14 +834,15 @@ form input[type=text]:focus, form textarea:focus{outline:none; border-color:var(
   box-shadow:0 0 0 3px rgba(34,197,94,.15);}
 form textarea{resize:vertical; min-height:160px;}
 .actions{display:flex; gap:12px; margin-top:18px; flex-wrap:wrap;}
-.delete-form{margin-top:14px; border-top:1px solid var(--border); padding-top:16px;}
+.sel-status{margin-left:auto;}
 
 @media (max-width:1024px){ .grid{grid-template-columns:repeat(2,1fr);} }
 @media (max-width:768px){
   .grid{grid-template-columns:1fr; gap:18px;}
   .hero{min-height:380px;} .hero-content{padding:24px 22px;}
+  .article-inner{padding:22px 20px 26px;}
   .admin-wrap{flex-direction:column;} .admin-list, .admin-review{width:100%;}
-  .admin-list{max-height:42vh;} .admin-review{position:static;}
+  .admin-list{max-height:46vh;} .admin-review{position:static;}
 }
 """
 
@@ -705,7 +862,7 @@ PUBLIC_TEMPLATE = """
 <body>
   {% macro card(a, eager=false, rank=none) -%}
   <a class="card {% if rank %}trending{% endif %}"
-     href="{{ url_for('track_click', article_id=a['id']) }}" target="_blank" rel="noopener noreferrer">
+     href="{{ url_for('article_detail', article_id=a['id']) }}">
     <div class="card-media">
       <img src="{{ article_image(a) }}" alt="{{ a.translated_title }}"
            loading="{{ 'eager' if eager else 'lazy' }}" onerror="this.style.opacity='0'">
@@ -746,8 +903,7 @@ PUBLIC_TEMPLATE = """
       <div class="hero-head section-head">
         <h3><span class="emoji">&#9889;</span>UDARNA VEST</h3><span class="line"></span>
       </div>
-      <a class="hero" href="{{ url_for('track_click', article_id=hero['id']) }}"
-         target="_blank" rel="noopener noreferrer">
+      <a class="hero" href="{{ url_for('article_detail', article_id=hero['id']) }}">
         <img src="{{ article_image(hero) }}" alt="{{ hero.translated_title }}"
              loading="eager" onerror="this.style.display='none'">
         <div class="hero-overlay"></div>
@@ -812,6 +968,86 @@ PUBLIC_TEMPLATE = """
 </html>
 """
 
+ARTICLE_DETAIL_TEMPLATE = """
+<!doctype html>
+<html lang="sr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ a.translated_title }} &#8211; Sportski Portal</title>
+  <style>{{ css|safe }}</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="brand" href="{{ url_for('index') }}"><span class="ball">&#9917;</span>Sportski<em>Portal</em></a>
+      <span class="live-dot">U&#382;ivo &#8211; RAM baza</span>
+    </div>
+  </header>
+
+  <main class="article-page">
+    <a class="back-link" href="{{ url_for('index') }}">&larr; Nazad na po&#269;etnu</a>
+
+    <article class="article-card">
+      <img class="article-cover" src="{{ article_image(a) }}" alt="{{ a.translated_title }}"
+           onerror="this.style.display='none'">
+      <div class="article-inner">
+        <div class="article-tags">
+          <span class="chip">{{ category_label(a) }}</span>
+          {% if a.priority == 1 %}<span class="badge-hot">&#9889; Udarna vest</span>{% endif %}
+          {% for club in club_badges(a) %}<span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>{% endfor %}
+        </div>
+
+        <h1 class="article-title">{{ a.translated_title }}</h1>
+
+        <div class="meta article-meta">
+          <span>&#128240; {{ a.source }}</span>
+          <span>&#128337; {{ a.published_date }}</span>
+          <span class="views">&#128065; <b>{{ a.views or 0 }}</b> pregleda</span>
+        </div>
+
+        <div class="article-body">
+          {% for para in paragraphs %}<p>{{ para }}</p>{% endfor %}
+        </div>
+
+        <div class="source-note">
+          Izvor: <b>{{ a.source }}</b>. Originalni &#269;lanak mo&#382;ete pogledati
+          <a href="{{ a.link }}" target="_blank" rel="noopener noreferrer">OVDE</a>.
+        </div>
+      </div>
+    </article>
+
+    <p style="text-align:center; margin:26px 0 40px;">
+      <a class="btn btn-ghost" href="{{ url_for('index') }}">&larr; Vrati se na sve vesti</a>
+    </p>
+  </main>
+</body>
+</html>
+"""
+
+ARTICLE_404_TEMPLATE = """
+<!doctype html>
+<html lang="sr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vest nije pronađena</title><style>{{ css|safe }}</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="brand" href="{{ url_for('index') }}"><span class="ball">&#9917;</span>Sportski<em>Portal</em></a>
+    </div>
+  </header>
+  <main class="container">
+    <div class="empty notfound">
+      <h3 style="margin-bottom:12px;">&#128533; Ta vest nije dostupna</h3>
+      <p style="margin-bottom:18px;">ILI je jo&#353; uvek na &#269;ekanju za odobrenje, ILI je obrisana.</p>
+      <a class="btn btn-green" href="{{ url_for('index') }}">&larr; Nazad na po&#269;etnu</a>
+    </div>
+  </main>
+</body>
+</html>
+"""
+
 ADMIN_TEMPLATE = """
 <!doctype html>
 <html lang="sr">
@@ -823,7 +1059,9 @@ ADMIN_TEMPLATE = """
   <header class="topbar">
     <div class="container topbar-inner">
       <div class="brand"><span class="ball">&#128736;</span>Admin<em>Kontrola</em></div>
-      <a class="btn btn-ghost" href="{{ url_for('index') }}">&larr; Javni sajt</a>
+      <div style="display:flex; gap:10px;">
+        <a class="btn btn-ghost" href="{{ url_for('index') }}">&larr; Javni sajt</a>
+      </div>
     </div>
   </header>
   <main class="container">
@@ -832,22 +1070,49 @@ ADMIN_TEMPLATE = """
     {% endwith %}
     <div class="admin-wrap">
       <aside class="admin-list">
-        <div class="panel-head">Na &#269;ekanju ({{ pending|length }})</div>
-        {% if pending %}
-          {% for a in pending %}
-          <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
-             href="{{ url_for('admin', article_id=a['id']) }}">
-            <div class="pi-title">{{ a.translated_title }}{% if a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
-            <div class="meta">{{ a.source }}</div>
-          </a>
-          {% endfor %}
-        {% else %}
-          <p class="empty-small">Sve prevedene vesti su obra&#273;ene.</p>
-        {% endif %}
+        <div class="admin-group">
+          <div class="group-head pending">&#9203; Na &#269;ekanju ({{ pending|length }})</div>
+          {% if pending %}
+            {% for a in pending %}
+            <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
+               href="{{ url_for('admin', article_id=a['id']) }}">
+              <div class="pi-title">{{ a.translated_title }}{% if a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
+              <div class="pi-meta meta">{{ a.source }}</div>
+            </a>
+            {% endfor %}
+          {% else %}
+            <p class="empty-small">Nema vesti na &#269;ekanju.</p>
+          {% endif %}
+        </div>
+
+        <div class="admin-group">
+          <div class="group-head published">&#128994; Objavljene vesti &#8211; u&#382;ivo ({{ published|length }})</div>
+          {% if published %}
+            {% for a in published %}
+            <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
+               href="{{ url_for('admin', article_id=a['id']) }}">
+              <div class="pi-title">{{ a.translated_title }}</div>
+              <div class="pi-meta meta">
+                <span>{{ a.source }}</span>
+                <span class="views">&#128065; <b>{{ a.views or 0 }}</b></span>
+              </div>
+            </a>
+            {% endfor %}
+          {% else %}
+            <p class="empty-small">Jo&#353; uvek nema objavljenih vesti.</p>
+          {% endif %}
+        </div>
       </aside>
+
       <section class="admin-review">
         {% if selected %}
-        <div class="panel-head">Pregled i obrada #{{ selected.id }}</div>
+        <div class="panel-head">
+          Pregled i obrada #{{ selected.id }}
+          <span class="sel-status">
+            {% if selected.status == 'published' %}<span class="badge-live">&#128994; U&#382;ivo na sajtu</span>
+            {% else %}<span class="chip">&#9203; Na &#269;ekanju</span>{% endif %}
+          </span>
+        </div>
         <div class="orig-ref">
           <div class="orig-label">Original &mdash; {{ selected.source }}</div>
           <strong>{{ selected.original_title }}</strong>
@@ -858,14 +1123,27 @@ ADMIN_TEMPLATE = """
           <input type="text" id="title" name="translated_title" value="{{ selected.translated_title }}" required>
           <label for="summary">Sa&#382;etak / &#269;lanak (srpski)</label>
           <textarea id="summary" name="translated_summary" rows="10" required>{{ selected.translated_summary }}</textarea>
-          <div class="actions"><button type="submit" class="btn btn-green">&#10003; Objavi vest</button></div>
+          <div class="actions">
+            {% if selected.status == 'published' %}
+              <button type="submit" class="btn btn-green">&#128190; Sa&#269;uvaj izmene (ostaje u&#382;ivo)</button>
+              <a class="btn btn-ghost" href="{{ url_for('article_detail', article_id=selected.id) }}" target="_blank" rel="noopener">&#128065; Pogledaj na sajtu</a>
+            {% else %}
+              <button type="submit" class="btn btn-green">&#10003; Objavi vest</button>
+            {% endif %}
+          </div>
         </form>
-        <form class="delete-form" method="post" action="{{ url_for('delete_article', article_id=selected.id) }}"
-              onsubmit="return confirm('Obrisati ovu vest zauvek?');">
-          <button type="submit" class="btn btn-red">&#128465; Obri&#353;i vest</button>
+        <form method="post" action="{{ url_for('delete_article', article_id=selected.id) }}"
+              onsubmit="return confirm('Obrisati ovu vest zauvek? Ova radnja se ne mo&#382;e poni&#353;titi.');">
+          {% if selected.status == 'published' %}
+            <button type="submit" class="btn btn-red big">&#128465; Obri&#353;i vest zauvek</button>
+          {% else %}
+            <div class="actions" style="margin-top:14px; border-top:1px solid var(--border); padding-top:16px;">
+              <button type="submit" class="btn btn-red">&#128465; Obri&#353;i vest</button>
+            </div>
+          {% endif %}
         </form>
         {% else %}
-        <div class="empty">&larr; Izaberite vest sa leve liste da biste je pregledali, uredili i objavili.</div>
+        <div class="empty">&larr; Izaberite vest sa leve liste (na &#269;ekanju ili ve&#263; objavljenu) da biste je pregledali, uredili ili obrisali.</div>
         {% endif %}
       </section>
     </div>
@@ -914,19 +1192,30 @@ def index():
     )
 
 
-@app.route("/click/<int:article_id>")
-def track_click(article_id: int):
+@app.route("/vest/<int:article_id>")
+def article_detail(article_id: int):
+    """Internal Serbian article reader (no external redirect). Counts the view."""
     db = get_db()
     with _db_lock:
         db.execute("UPDATE articles SET views = views + 1 WHERE id = ?", (article_id,))
         db.commit()
-        row = db.execute("SELECT link FROM articles WHERE id = ?", (article_id,)).fetchone()
-    if row and row["link"]:
-        return redirect(row["link"], code=302)
-    return redirect(url_for("index"))
+        row = db.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
+
+    # Only published articles are publicly readable; pending/missing -> 404.
+    if not row or row["status"] != "published":
+        return render_template_string(ARTICLE_404_TEMPLATE, css=BASE_CSS), 404
+
+    body = row["translated_summary"] or ""
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", body) if p.strip()]
+    if not paragraphs and body:
+        paragraphs = [body]
+
+    return render_template_string(
+        ARTICLE_DETAIL_TEMPLATE, a=row, paragraphs=paragraphs, css=BASE_CSS,
+    )
 
 
-@app.route("/osvezi-vesti-777")
+@app.route(REFRESH_PATH)
 def rucno_osvezi_vesti_iz_rama():
     """
     Ruta za ručno forsiranje RSS fetcher-a i prevodioca na Render Free okruženju.
@@ -936,16 +1225,10 @@ def rucno_osvezi_vesti_iz_rama():
     try:
         print("[MANUAL FETCH] Pokretanje ručnog osvežavanja vesti kroz HTTP zahtev...")
         run_fetcher_cycle()
-        with _db_lock:
-            total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()["c"]
-            live = _db.execute(
-                "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()["c"]
         return (
             "<h3>Uspeh!</h3>"
             "<p>Robot je ručno pokrenut i RAM baza je upravo osvežena novim sportskim vestima.</p>"
-            f"<p>Ukupno u bazi: <b>{total}</b> &mdash; objavljeno (uživo): <b>{live}</b>.</p>"
-            "<p><a href='/'>Vrati se na početnu stranicu</a> ili idi na <a href='"
-            + ADMIN_PATH + "'>Admin Panel</a>.</p>"
+            "<p><a href='/'>Vrati se na početnu stranicu</a> ili idi na <a href='" + ADMIN_PATH + "'>Admin Panel</a>.</p>"
         )
     except Exception as e:
         print(f"[MANUAL FETCH][ERROR] Greška prilikom ručnog osvežavanja: {e}")
@@ -957,16 +1240,24 @@ def admin():
     db = get_db()
     with _db_lock:
         pending = db.execute(
-            """SELECT id, source, translated_title, priority FROM articles
+            """SELECT id, source, translated_title, priority
+               FROM articles
                WHERE status='pending' AND translated_title != ''
                ORDER BY priority DESC, published_date DESC, id DESC"""
+        ).fetchall()
+        published = db.execute(
+            """SELECT id, source, translated_title, priority, views
+               FROM articles WHERE status='published'
+               ORDER BY published_date DESC, id DESC"""
         ).fetchall()
         selected = None
         article_id = request.args.get("article_id", type=int)
         if article_id:
             selected = db.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
-    return render_template_string(ADMIN_TEMPLATE, pending=pending,
-                                  selected=selected, css=BASE_CSS)
+    return render_template_string(
+        ADMIN_TEMPLATE, pending=pending, published=published,
+        selected=selected, css=BASE_CSS,
+    )
 
 
 @app.post("/admin/publish/<int:article_id>")
@@ -982,8 +1273,8 @@ def publish_article(article_id: int):
             """UPDATE articles SET translated_title=?, translated_summary=?, status='published'
                WHERE id=?""", (title, summary, article_id))
         db.commit()
-    flash(f"Vest #{article_id} je objavljena.")
-    return redirect(url_for("admin"))
+    flash(f"Vest #{article_id} je sa&#269;uvana i objavljena.")
+    return redirect(url_for("admin", article_id=article_id))
 
 
 @app.post("/admin/delete/<int:article_id>")
@@ -992,7 +1283,7 @@ def delete_article(article_id: int):
     with _db_lock:
         db.execute("DELETE FROM articles WHERE id = ?", (article_id,))
         db.commit()
-    flash(f"Vest #{article_id} je obrisana.")
+    flash(f"Vest #{article_id} je obrisana zauvek.")
     return redirect(url_for("admin"))
 
 
