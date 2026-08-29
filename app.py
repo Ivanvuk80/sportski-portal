@@ -516,14 +516,21 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
     for row in rows:
         article_id = row["id"]
         try:
+            # In AI mode, foreign feeds (Marca/Sky/Ole) often have an empty or
+            # very short summary (<30 chars). Feed Gemini the TITLE so it can
+            # write a full 2-3 paragraph article from the headline alone.
+            ai_body_material = row["original_summary"] or ""
+            if TRANSLATION_MODE == "ai" and len(ai_body_material.strip()) < 30:
+                ai_body_material = row["original_title"]
+
             if row["source_lang"] == "sr":
                 # Ako je TRANSLATION_MODE postavljen na "ai", šaljemo i domaću
                 # vest na proširivanje u 2-3 pasusa (naslov ostaje izvoran).
                 if TRANSLATION_MODE == "ai" and os.environ.get("GEMINI_API_KEY"):
                     tr_title = localize_post(row["original_title"])
-                    # Ugrađeni AI novinar od jedne domaće rečenice pravi ceo članak.
+                    # Ugrađeni AI novinar od naslova/jedne rečenice pravi ceo članak.
                     tr_summary = translate_text(
-                        row["original_summary"], is_headline=False,
+                        ai_body_material, is_headline=False,
                         source_headline=row["original_title"])
                 else:
                     # Već na srpskom -> prikaži direktno, samo lokalno srediti imena.
@@ -536,9 +543,9 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
                 tr_title = translate_text(row["original_title"], is_headline=True,
                                           source_headline=row["original_title"])
                 tr_summary = (
-                    translate_text(row["original_summary"], is_headline=False,
+                    translate_text(ai_body_material, is_headline=False,
                                    source_headline=row["original_title"])
-                    if row["original_summary"] else ""
+                    if ai_body_material else ""
                 )
             status = (
                 "published"
@@ -930,10 +937,10 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .article-meta{margin-bottom:22px; padding-bottom:18px; border-bottom:1px solid var(--border);}
 .article-body{font-size:1.08rem; line-height:1.9; color:#dbe4f0;}
 .article-body p{margin-bottom:18px;}
-.source-note{margin-top:30px; background:var(--panel-2); border:1px solid var(--border);
-  border-left:4px solid var(--green); border-radius:10px; padding:16px 20px;
-  font-size:.98rem; color:#cbd5e1;}
-.source-note a{color:var(--green); font-weight:800; text-decoration:underline;}
+.source-discreet{margin-top:34px; padding-top:18px; border-top:1px solid var(--border);
+  font-size:.78rem; line-height:1.6; color:var(--muted);}
+.source-discreet a{color:var(--muted); text-decoration:underline;}
+.source-discreet a:hover{color:var(--text);}
 .notfound{max-width:560px; margin:70px auto; text-align:center;}
 
 .btn{display:inline-block; border:none; border-radius:9px; padding:11px 20px;
@@ -1042,7 +1049,6 @@ PUBLIC_TEMPLATE = """
       {% endif %}
       <p class="card-excerpt">{{ a.translated_summary }}</p>
       <div class="meta">
-        <span>&#128240; {{ a.source }}</span>
         <span>&#128337; {{ a.published_date }}</span>
         <span class="views">&#128065; <b>{{ a.views or 0 }}</b></span>
       </div>
@@ -1093,8 +1099,8 @@ PUBLIC_TEMPLATE = """
           <h2>{{ hero.translated_title }}</h2>
           <p>{{ hero.translated_summary }}</p>
           <div class="meta">
-            <span>&#128240; {{ hero.source }}</span>
             <span>&#128337; {{ hero.published_date }}</span>
+            <span class="views">&#128065; <b>{{ hero.views or 0 }}</b></span>
           </div>
         </div>
       </a>
@@ -1189,7 +1195,6 @@ ARTICLE_DETAIL_TEMPLATE = """
         <h1 class="article-title">{{ a.translated_title }}</h1>
 
         <div class="meta article-meta">
-          <span>&#128240; {{ a.source }}</span>
           <span>&#128337; {{ a.published_date }}</span>
           <span class="views">&#128065; <b>{{ a.views or 0 }}</b> pregleda</span>
         </div>
@@ -1198,10 +1203,11 @@ ARTICLE_DETAIL_TEMPLATE = """
           {% for para in paragraphs %}<p>{{ para }}</p>{% endfor %}
         </div>
 
-        <div class="source-note">
-          Izvor: <b>{{ a.source }}</b>. Originalni &#269;lanak mo&#382;ete pogledati
-          <a href="{{ a.link }}" target="_blank" rel="noopener noreferrer">OVDE</a>.
-        </div>
+        <p class="source-discreet">
+          Informacije u ovom &#269;lanku preuzete su sa portala
+          <a href="{{ a.link }}" target="_blank" rel="noopener noreferrer"
+             style="color:var(--muted); text-decoration:underline;">{{ a.source }}</a>.
+        </p>
       </div>
     </article>
 
