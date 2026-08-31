@@ -23,8 +23,10 @@ Env vars (all optional):
                              If missing/unset, the app safely falls back to free.
     GEMINI_MODEL             Gemini model (default "gemini-2.5-flash")
     GOOGLE_API_KEY/GOOGLE_CX optional Google image search (real photos).
-    MAX_TRANSLATIONS_PER_RUN default 8 per cycle
-    FETCH_INTERVAL_SECONDS   autopilot loop interval (default 600)
+    MAX_TRANSLATIONS_PER_RUN default 1 per cycle
+    FEED_TIMEOUT_SECONDS      timeout for each RSS request (default 8)
+    MAX_FEEDS_PER_FETCH       RSS feeds per cron call (default 2)
+    FETCH_INTERVAL_SECONDS    autopilot loop interval (default 600)
     RUN_FETCHER              "0" to disable the background fetcher
     AUTOPILOT_PUBLISH        "1" (default) auto-publishes every translated
                              article live; "0" holds everything in the admin
@@ -57,7 +59,8 @@ try:  # free translation mode (deep-translator)
 except ImportError:  # pragma: no cover
     GoogleTranslator = None
 
-socket.setdefaulttimeout(15)
+# Fallback socket timeout. RSS requests below also pass an explicit timeout.
+socket.setdefaulttimeout(10)
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -75,7 +78,9 @@ GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "{model}:generateContent?key={key}"
 )
-MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 8))
+# Temporary Render-safe default: one translation per refresh cycle.
+# Increase only after the worker/queue architecture is in place.
+MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 1))
 # AUTOMATIC publishing: every successfully translated article goes live on its
 # own as a 'standard' card. Placement still follows the priority criteria
 # (Zvezda p=2 -> hero, etc.) and the admin panel ALWAYS stays available so any
@@ -84,6 +89,9 @@ MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 8))
 AUTOPILOT_PUBLISH = os.environ.get("AUTOPILOT_PUBLISH", "1") != "0"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", 600))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
+FEED_TIMEOUT_SECONDS = int(os.environ.get("FEED_TIMEOUT_SECONDS", 8))
+# Conservative default for a synchronous HTTP cron request: two feeds at a time.
+MAX_FEEDS_PER_FETCH = int(os.environ.get("MAX_FEEDS_PER_FETCH", 2))
 
 # Full browser User-Agent so foreign CDNs/servers do not block our requests.
 BROWSER_UA = (
@@ -112,6 +120,11 @@ SPORTS_FEEDS = [
     {"name": "Clarín (Argentina)", "url": "https://www.clarin.com/rss/deportes/", "lang": "es"},
     {"name": "Globo Esporte (Brazil)", "url": "https://ge.globo.com/dynamo/rss2.xml", "lang": "pt"},
 ]
+
+# The cron route fetches only a rotating subset of feeds per call. This keeps a
+# slow or unavailable feed from making every refresh request wait for all feeds.
+_feed_cursor = 0
+_feed_cursor_lock = threading.Lock()
 
 # ABSOLUTE priority (priority=2): an article mentioning Crvena zvezda always
 # claims the Hero ("Udarna vest") slot, ahead of any general foreign news.
@@ -148,6 +161,10 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-in-pro
 _db_lock = threading.RLock()
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.row_factory = sqlite3.Row
+
+# Prevent the background fetcher and the HTTP refresh route from running
+# overlapping RSS/Gemini cycles and spending duplicate API calls.
+_cycle_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -453,13 +470,55 @@ def _translate_ai(text: str, is_headline: bool, source_headline: str | None) -> 
 
 # ---------- Fetch / store cycle ---------- #
 
-def fetch_all_feeds() -> tuple[int, int]:
-    """Pull every feed, dedupe by link, skip junk per-article. Returns (new, skipped)."""
+def _next_feed_batch() -> list[dict]:
+    """Return the next rotating subset of RSS feeds for this process."""
+    global _feed_cursor
+    if not SPORTS_FEEDS:
+        return []
+
+    batch_size = max(1, min(MAX_FEEDS_PER_FETCH, len(SPORTS_FEEDS)))
+    with _feed_cursor_lock:
+        start = _feed_cursor
+        indexes = [
+            (start + offset) % len(SPORTS_FEEDS)
+            for offset in range(batch_size)
+        ]
+        _feed_cursor = (start + batch_size) % len(SPORTS_FEEDS)
+    return [SPORTS_FEEDS[index] for index in indexes]
+
+
+def _fetch_and_parse_feed(url: str):
+    """Download one feed with an explicit timeout, then parse its bytes."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml",
+            "Accept-Encoding": "identity",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=FEED_TIMEOUT_SECONDS) as response:
+        raw = response.read()
+    return feedparser.parse(raw)
+
+
+def fetch_all_feeds(feeds: list[dict] | None = None) -> tuple[int, int]:
+    """Fetch a rotating feed batch, dedupe by link and skip junk per article.
+
+    By default only MAX_FEEDS_PER_FETCH feeds are fetched. Passing ``feeds`` is
+    useful for tests or an explicit full refresh.
+    """
+    feeds_to_fetch = feeds if feeds is not None else _next_feed_batch()
     new = skipped = 0
-    for feed in SPORTS_FEEDS:
+    print(
+        f"[FETCH] Starting batch: {len(feeds_to_fetch)} feed(s), "
+        f"timeout={FEED_TIMEOUT_SECONDS}s"
+    )
+
+    for feed in feeds_to_fetch:
         source, url, lang = feed["name"], feed["url"], feed.get("lang", "auto")
         try:
-            parsed = feedparser.parse(url, agent=BROWSER_UA)
+            parsed = _fetch_and_parse_feed(url)
             if parsed.bozo and not parsed.entries:
                 raise parsed.bozo_exception or RuntimeError("Feed vratio 0 vesti")
 
@@ -589,13 +648,24 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
 
 
 def run_fetcher_cycle() -> None:
-    new, skipped = fetch_all_feeds()
-    process_translations()
-    with _db_lock:
-        total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()[0]
-        live = _db.execute(
-            "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()[0]
-    print(f"[AUTOPILOT] cycle: {new} new, {skipped} skipped/dupes | DB {total} | live {live}")
+    """Run the legacy background cycle, but never overlap another cycle."""
+    if not _cycle_lock.acquire(blocking=False):
+        print("[AUTOPILOT] cycle skipped: another cycle is already running")
+        return
+
+    try:
+        new, skipped = fetch_all_feeds()
+        process_translations()
+        with _db_lock:
+            total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()[0]
+            live = _db.execute(
+                "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()[0]
+        print(
+            f"[AUTOPILOT] cycle: {new} new, {skipped} skipped/dupes | "
+            f"DB {total} | live {live}"
+        )
+    finally:
+        _cycle_lock.release()
 
 
 def _fetcher_loop() -> None:
@@ -1465,22 +1535,65 @@ def article_detail(article_id: int):
 
 @app.route(REFRESH_PATH)
 def rucno_osvezi_vesti_iz_rama():
+    """Cron endpoint with alternating work:
+
+    * if untranslated articles exist, translate only one;
+    * otherwise fetch the RSS feeds and return immediately after fetching.
+
+    This keeps the expensive translation phase out of the same HTTP request as
+    the RSS phase. The endpoint still needs authentication in production; the
+    current first change focuses on the cycle strategy and duplicate protection.
     """
-    Ruta za ručno forsiranje RSS fetcher-a i prevodioca na Render Free okruženju.
-    Slanjem HTTP GET zahteva, Render izvršava ciklus unutar glavne niti zahteva,
-    čime se sprečava gašenje procesa i puni volatile :memory: baza podataka.
-    """
-    try:
-        print("[MANUAL FETCH] Pokretanje ručnog osvežavanja vesti kroz HTTP zahtev...")
-        run_fetcher_cycle()
+    if not _cycle_lock.acquire(blocking=False):
         return (
-            "<h3>Uspeh!</h3>"
-            "<p>Robot je ručno pokrenut i RAM baza je upravo osvežena novim sportskim vestima.</p>"
-            "<p><a href='/'>Vrati se na početnu stranicu</a> ili idi na <a href='" + ADMIN_PATH + "'>Admin Panel</a>.</p>"
+            "<h3>Ciklus je već u toku</h3>"
+            "<p>Sačekaj sledeći cron poziv.</p>"
+        ), 202
+
+    try:
+        with _db_lock:
+            pending = _db.execute(
+                """SELECT 1 FROM articles
+                   WHERE status='pending'
+                     AND translated_title = ''
+                     AND translated_summary = ''
+                   LIMIT 1"""
+            ).fetchone()
+
+        if pending:
+            print("[CRON] Pronađena sirova vest. Pokrećem prevod samo jedne vesti...")
+            translated, failed = process_translations(limit=1)
+            if translated:
+                return (
+                    "<h3>Uspeh!</h3>"
+                    "<p>Jedna vest je uspešno obrađena.</p>"
+                )
+            if failed:
+                return (
+                    "<h3>Prevod nije uspeo</h3>"
+                    "<p>Vest ostaje na čekanju i biće ponovo obrađena.</p>"
+                ), 502
+            return (
+                "<h3>Nema obrađene vesti</h3>"
+                "<p>Proveri Render log.</p>"
+            ), 202
+
+        print("[CRON] Nema sirovih vesti. Pokrećem skidanje RSS feedova...")
+        new, skipped = fetch_all_feeds()
+        return (
+            "<h3>RSS osvežen</h3>"
+            f"<p>Povučenih novih: {new}, preskočeno: {skipped}.</p>"
+            "<p>Prevod će se pokrenuti sledećim cron pozivom.</p>"
         )
-    except Exception as e:
-        print(f"[MANUAL FETCH][ERROR] Greška prilikom ručnog osvežavanja: {e}")
-        return f"<h3>Greška prilikom buđenja robota:</h3><p>{e}</p>", 500
+    except Exception as exc:
+        print(f"[CRON][ERROR] Greška tokom pametnog ciklusa: {exc}")
+        # Do not expose raw exception text in a public HTML response.
+        return (
+            "<h3>Greška tokom osvežavanja</h3>"
+            "<p>Pogledaj Render log za detalje.</p>"
+        ), 500
+    finally:
+        _cycle_lock.release()
 
 
 @app.route(ADMIN_PATH)
@@ -1556,3 +1669,4 @@ start_background_fetcher()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
