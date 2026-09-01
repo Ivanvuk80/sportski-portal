@@ -1,22 +1,28 @@
 """
-Sports News Aggregator - Single-file, diskless, self-updating build.
+Sports News Aggregator - Single-file, self-updating build.
 
 Everything runs from THIS file:
   * Flask web portal + secret admin dashboard + internal article reader
   * RSS fetcher / per-article junk filter / sports localization / translation
 
 Key deployment choices:
-  * DATABASE_PATH = ":memory:"  -> SQLite lives in RAM and never touches disk.
-    One shared connection (check_same_thread=False) guarded by a global RLock so
-    the web request threads and the background fetcher thread share data safely.
-  * The fetcher runs on a BACKGROUND THREAD (autopilot). A secret HTTP route
+  * DATABASE_URL, when set, -> PostgreSQL stores articles persistently across
+    Render restarts and redeploys. Without it, local fallback is SQLite/RAM.
+    One shared connection guarded by a global RLock so the web request threads
+    and the background fetcher thread share data safely.
+  * The fetcher runs on a BACKGROUND THREAD (autopilot). A token-protected HTTP route
     (/osvezi-vesti-777) also forces a cycle inside the request thread, which is
     the reliable way to refill the volatile DB on Render Free.
 
-Trade-off: RAM is volatile, so the DB reseeds from RSS on every process start.
+If DATABASE_URL is not set, the local SQLite/RAM fallback is volatile and
+reseeds from RSS on every process start. Configure Render PostgreSQL in production.
 
 Env vars (all optional):
+    DATABASE_URL             PostgreSQL connection URL (required for persistent production data)
     SECRET_KEY               Flask secret (set in production!)
+    REFRESH_TOKEN            secret token required by the cron refresh route
+    ADMIN_PASSWORD           admin password (simple setup; use a hash when possible)
+    ADMIN_PASSWORD_HASH      optional Werkzeug password hash (preferred over plain password)
     PORT                     HTTP port (default 5000)
     TRANSLATION_MODE         "ai" (default, uses Gemini) or "free" (Google translate)
     GEMINI_API_KEY           Google AI Studio key -> full 2-3 paragraph articles.
@@ -40,19 +46,33 @@ Run:
 """
 
 import html
+import hmac
 import json
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import threading
 import time
 import urllib.parse
 import urllib.request
+from functools import wraps
 from typing import Any
 
 import feedparser
-from flask import Flask, flash, redirect, render_template_string, request, url_for
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # local SQLite mode can still run without psycopg installed
+    psycopg = None
+    dict_row = None
+
+from flask import (
+    Flask, flash, redirect, render_template_string, request, session, url_for,
+)
+from werkzeug.security import check_password_hash
 
 try:  # free translation mode (deep-translator)
     from deep_translator import GoogleTranslator
@@ -66,9 +86,20 @@ socket.setdefaulttimeout(10)
 # Configuration
 # --------------------------------------------------------------------------- #
 
-DB_PATH = ":memory:"                        # RAM only - never touches the disk
-ADMIN_PATH = "/admin-tajna-kontrola-777"    # secret admin URL
-REFRESH_PATH = "/osvezi-vesti-777"          # secret "wake the robot" HTTP trigger
+# Production uses Render PostgreSQL through DATABASE_URL. SQLite remains as a
+# local fallback so the app can still be run without a database service.
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL")
+    or ""
+).strip()
+DB_PATH = os.environ.get("DB_PATH", ":memory:")
+DB_DIALECT = "postgres" if DATABASE_URL else "sqlite"
+
+ADMIN_PATH = "/admin-tajna-kontrola-777"    # admin entry URL
+ADMIN_LOGIN_PATH = ADMIN_PATH + "/login"
+ADMIN_LOGOUT_PATH = ADMIN_PATH + "/logout"
+REFRESH_PATH = "/osvezi-vesti-777"          # cron refresh trigger
 
 TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "ai")    # "ai" | "free"
 TARGET_LANGUAGE = "sr"
@@ -89,6 +120,9 @@ MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 1))
 AUTOPILOT_PUBLISH = os.environ.get("AUTOPILOT_PUBLISH", "1") != "0"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", 600))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
+REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
 FEED_TIMEOUT_SECONDS = int(os.environ.get("FEED_TIMEOUT_SECONDS", 8))
 # Conservative default for a synchronous HTTP cron request: two feeds at a time.
 MAX_FEEDS_PER_FETCH = int(os.environ.get("MAX_FEEDS_PER_FETCH", 2))
@@ -157,14 +191,108 @@ TRANSLATION_ERROR_MARKERS = (
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-in-production")
 
-# One shared in-memory connection + a lock for multi-thread (Flask + fetcher) access.
+class _DatabaseAdapter:
+    """Small compatibility layer for existing qmark SQL in SQLite/PostgreSQL."""
+
+    def __init__(self, connection, dialect: str):
+        self.connection = connection
+        self.dialect = dialect
+
+    def execute(self, sql: str, params=()):
+        if self.dialect == "postgres":
+            # All application queries use ? placeholders. psycopg uses %s.
+            sql = sql.replace("?", "%s")
+        return self.connection.execute(sql, params)
+
+    def commit(self):
+        return self.connection.commit()
+
+    def rollback(self):
+        return self.connection.rollback()
+
+
+# One shared connection + a lock for multi-thread (Flask + fetcher) access.
+# PostgreSQL is the production database; SQLite/RAM is only a local fallback.
 _db_lock = threading.RLock()
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.row_factory = sqlite3.Row
+if DATABASE_URL:
+    if psycopg is None:
+        raise RuntimeError(
+            "DATABASE_URL je podešen, ali psycopg nije instaliran. "
+            "Dodaj psycopg[binary] u requirements.txt."
+        )
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+    _raw_db = psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=10,
+    )
+else:
+    _raw_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+    _raw_db.row_factory = sqlite3.Row
+
+_db = _DatabaseAdapter(_raw_db, DB_DIALECT)
 
 # Prevent the background fetcher and the HTTP refresh route from running
 # overlapping RSS/Gemini cycles and spending duplicate API calls.
 _cycle_lock = threading.Lock()
+
+# Secure session cookie defaults for the production HTTPS deployment.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1") != "0",
+)
+
+
+def _admin_auth_configured() -> bool:
+    return bool(ADMIN_PASSWORD_HASH or ADMIN_PASSWORD)
+
+
+def _verify_admin_password(candidate: str) -> bool:
+    if ADMIN_PASSWORD_HASH:
+        try:
+            return check_password_hash(ADMIN_PASSWORD_HASH, candidate)
+        except (ValueError, TypeError):
+            return False
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(candidate, ADMIN_PASSWORD)
+
+
+def csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def valid_csrf_token() -> bool:
+    expected = session.get("csrf_token", "")
+    supplied = request.form.get("csrf_token", "")
+    return bool(expected and supplied) and hmac.compare_digest(expected, supplied)
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _admin_auth_configured():
+            return (
+                "Admin password nije podešen. Dodaj ADMIN_PASSWORD ili "
+                "ADMIN_PASSWORD_HASH u Render Environment Variables.",
+                503,
+            )
+        if not session.get("admin_authenticated"):
+            return redirect(url_for("admin_login"))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def valid_refresh_token() -> bool:
+    """Accept a header; query-string fallback supports simple cron providers."""
+    supplied = request.headers.get("X-Refresh-Token", "")
+    if not supplied:
+        supplied = request.args.get("token", "")
+    return bool(REFRESH_TOKEN) and hmac.compare_digest(supplied, REFRESH_TOKEN)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,9 +326,29 @@ AI_BODY_SYSTEM_PROMPT = (
 #  IN-MEMORY DATABASE
 # =========================================================================== #
 
-SCHEMA_SQL = """
+SCHEMA_SQL_SQLITE = """
 CREATE TABLE IF NOT EXISTS articles (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source             TEXT    NOT NULL,
+    original_title     TEXT    NOT NULL,
+    original_summary   TEXT    DEFAULT '',
+    link               TEXT    NOT NULL UNIQUE,
+    published_date     TEXT,
+    translated_title   TEXT    NOT NULL DEFAULT '',
+    translated_summary TEXT    NOT NULL DEFAULT '',
+    source_lang        TEXT    NOT NULL DEFAULT 'auto',
+    priority           INTEGER NOT NULL DEFAULT 0,
+    status             TEXT    NOT NULL DEFAULT 'pending'
+                                        CHECK (status IN ('pending','published')),
+    position           TEXT    NOT NULL DEFAULT 'standard'
+                                        CHECK (position IN ('hero','trending','standard')),
+    views              INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+SCHEMA_SQL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS articles (
+    id                 BIGSERIAL PRIMARY KEY,
     source             TEXT    NOT NULL,
     original_title     TEXT    NOT NULL,
     original_summary   TEXT    DEFAULT '',
@@ -221,18 +369,27 @@ CREATE TABLE IF NOT EXISTS articles (
 
 def init_db() -> None:
     with _db_lock:
-        _db.execute(SCHEMA_SQL)
-        # Lightweight migration for any pre-existing table without `position`.
-        cols = {row[1] for row in _db.execute("PRAGMA table_info(articles)")}
-        if "position" not in cols:
+        if DB_DIALECT == "postgres":
+            _db.execute(SCHEMA_SQL_POSTGRES)
+            # PostgreSQL migration for databases created by an older version.
             _db.execute(
-                "ALTER TABLE articles ADD COLUMN position "
-                "TEXT NOT NULL DEFAULT 'standard'")
+                "ALTER TABLE articles ADD COLUMN IF NOT EXISTS position "
+                "TEXT NOT NULL DEFAULT 'standard'"
+            )
+        else:
+            _db.execute(SCHEMA_SQL_SQLITE)
+            # SQLite migration for any pre-existing table without `position`.
+            cols = {row[1] for row in _db.execute("PRAGMA table_info(articles)")}
+            if "position" not in cols:
+                _db.execute(
+                    "ALTER TABLE articles ADD COLUMN position "
+                    "TEXT NOT NULL DEFAULT 'standard'"
+                )
         _db.commit()
 
 
-def get_db() -> sqlite3.Connection:
-    """All threads share the SAME in-memory connection; the RLock serializes."""
+def get_db():
+    """Return the shared database connection; _db_lock serializes access."""
     return _db
 
 
@@ -657,9 +814,9 @@ def run_fetcher_cycle() -> None:
         new, skipped = fetch_all_feeds()
         process_translations()
         with _db_lock:
-            total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()[0]
+            total = _db.execute("SELECT COUNT(*) c FROM articles").fetchone()["c"]
             live = _db.execute(
-                "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()[0]
+                "SELECT COUNT(*) c FROM articles WHERE status='published'").fetchone()["c"]
         print(
             f"[AUTOPILOT] cycle: {new} new, {skipped} skipped/dupes | "
             f"DB {total} | live {live}"
@@ -876,6 +1033,7 @@ app.jinja_env.globals.update(
     article_category=article_category,
     category_label=category_label,
     club_badges=club_badges,
+    csrf_token=csrf_token,
 )
 
 
@@ -1329,6 +1487,37 @@ ARTICLE_404_TEMPLATE = """
 </html>
 """
 
+ADMIN_LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="sr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin prijava</title><style>{{ css|safe }}</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand"><span class="ball">&#128274;</span>Admin<em>Prijava</em></div>
+      <a class="btn btn-ghost" href="{{ url_for('index') }}">Javni sajt</a>
+    </div>
+  </header>
+  <main class="container">
+    <section class="panel" style="max-width:480px; margin:70px auto; padding:24px;">
+      <div class="panel-head">Prijava u admin panel</div>
+      {% if error %}<div class="flash" style="color:#fecaca; border-color:var(--red);">{{ error }}</div>{% endif %}
+      <form method="post" action="{{ url_for('admin_login') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="password">Lozinka</label>
+        <input type="password" id="password" name="password" required autofocus>
+        <button type="submit" class="btn btn-green" style="margin-top:18px; width:100%;">&#128274; Prijavi se</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
 ADMIN_TEMPLATE = """
 <!doctype html>
 <html lang="sr">
@@ -1340,8 +1529,12 @@ ADMIN_TEMPLATE = """
   <header class="topbar">
     <div class="container topbar-inner">
       <div class="brand"><span class="ball">&#128736;</span>Admin<em>Kontrola</em></div>
-      <div style="display:flex; gap:10px;">
+      <div style="display:flex; gap:10px; align-items:center;">
         <a class="btn btn-ghost" href="{{ url_for('index') }}">&larr; Javni sajt</a>
+        <form method="post" action="{{ url_for('admin_logout') }}" style="display:inline;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn-ghost">Odjava</button>
+        </form>
       </div>
     </div>
   </header>
@@ -1400,6 +1593,7 @@ ADMIN_TEMPLATE = """
           <p>{{ selected.original_summary }}</p>
         </div>
         <form method="post" action="{{ url_for('publish_article', article_id=selected.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label for="title">Naslov (srpski)</label>
           <input type="text" id="title" name="translated_title" value="{{ selected.translated_title }}" required>
           <label for="summary">Sa&#382;etak / &#269;lanak (srpski)</label>
@@ -1438,6 +1632,7 @@ ADMIN_TEMPLATE = """
         </form>
         <form method="post" action="{{ url_for('delete_article', article_id=selected.id) }}"
               onsubmit="return confirm('Obrisati ovu vest zauvek? Ova radnja se ne mo&#382;e poni&#353;titi.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           {% if selected.status == 'published' %}
             <button type="submit" class="btn btn-red big">&#128465; Obri&#353;i vest zauvek</button>
           {% else %}
@@ -1544,6 +1739,12 @@ def rucno_osvezi_vesti_iz_rama():
     the RSS phase. The endpoint still needs authentication in production; the
     current first change focuses on the cycle strategy and duplicate protection.
     """
+    if not REFRESH_TOKEN:
+        print("[CRON][ERROR] REFRESH_TOKEN nije podešen.")
+        return "Cron ruta nije konfigurisana.", 503
+    if not valid_refresh_token():
+        return "Forbidden", 403
+
     if not _cycle_lock.acquire(blocking=False):
         return (
             "<h3>Ciklus je već u toku</h3>"
@@ -1596,7 +1797,45 @@ def rucno_osvezi_vesti_iz_rama():
         _cycle_lock.release()
 
 
+@app.route(ADMIN_LOGIN_PATH, methods=["GET", "POST"])
+def admin_login():
+    if not _admin_auth_configured():
+        return (
+            "Admin login nije konfigurisan. Dodaj ADMIN_PASSWORD ili "
+            "ADMIN_PASSWORD_HASH u Render Environment Variables.",
+            503,
+        )
+
+    error = ""
+    if request.method == "POST":
+        if not valid_csrf_token():
+            return "Nevažeći CSRF token.", 400
+        password = request.form.get("password", "")
+        if _verify_admin_password(password):
+            session.clear()
+            session["admin_authenticated"] = True
+            session["csrf_token"] = secrets.token_urlsafe(32)
+            return redirect(url_for("admin"))
+        error = "Pogrešna lozinka."
+
+    return render_template_string(
+        ADMIN_LOGIN_TEMPLATE,
+        css=BASE_CSS,
+        error=error,
+    )
+
+
+@app.post(ADMIN_LOGOUT_PATH)
+@admin_required
+def admin_logout():
+    if not valid_csrf_token():
+        return "Nevažeći CSRF token.", 400
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+
 @app.route(ADMIN_PATH)
+@admin_required
 def admin():
     db = get_db()
     with _db_lock:
@@ -1622,7 +1861,10 @@ def admin():
 
 
 @app.post("/admin/publish/<int:article_id>")
+@admin_required
 def publish_article(article_id: int):
+    if not valid_csrf_token():
+        return "Nevažeći CSRF token.", 400
     title = (request.form.get("translated_title") or "").strip()
     summary = (request.form.get("translated_summary") or "").strip()
     position = (request.form.get("position") or "standard").strip()
@@ -1650,7 +1892,10 @@ def publish_article(article_id: int):
 
 
 @app.post("/admin/delete/<int:article_id>")
+@admin_required
 def delete_article(article_id: int):
+    if not valid_csrf_token():
+        return "Nevažeći CSRF token.", 400
     db = get_db()
     with _db_lock:
         db.execute("DELETE FROM articles WHERE id = ?", (article_id,))
@@ -1664,9 +1909,9 @@ def delete_article(article_id: int):
 # =========================================================================== #
 
 init_db()
+print(f"[DB] connected using {DB_DIALECT}")
 start_background_fetcher()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-
