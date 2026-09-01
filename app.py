@@ -28,7 +28,8 @@ Env vars (all optional):
     GEMINI_API_KEY           Google AI Studio key -> full 2-3 paragraph articles.
                              If missing/unset, the app safely falls back to free.
     GEMINI_MODEL             Gemini model (default "gemini-2.5-flash")
-    GOOGLE_API_KEY/GOOGLE_CX optional Google image search (real photos).
+    GOOGLE_API_KEY/GOOGLE_CX optional Google image search; requires
+                             ALLOW_EXTERNAL_IMAGES=1 and verified image rights.
     MAX_TRANSLATIONS_PER_RUN default 1 per cycle
     FEED_TIMEOUT_SECONDS      timeout for each RSS request (default 8)
     MAX_FEEDS_PER_FETCH       RSS feeds per cron call (default 2)
@@ -126,6 +127,9 @@ ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
 FEED_TIMEOUT_SECONDS = int(os.environ.get("FEED_TIMEOUT_SECONDS", 8))
 # Conservative default for a synchronous HTTP cron request: two feeds at a time.
 MAX_FEEDS_PER_FETCH = int(os.environ.get("MAX_FEEDS_PER_FETCH", 2))
+# External image search is opt-in only. Google results are not assumed to be
+# licensed for republication; keep the owned inline SVG fallback by default.
+ALLOW_EXTERNAL_IMAGES = os.environ.get("ALLOW_EXTERNAL_IMAGES", "0") == "1"
 
 # Full browser User-Agent so foreign CDNs/servers do not block our requests.
 BROWSER_UA = (
@@ -136,19 +140,26 @@ BROWSER_UA = (
 # Feeds with "lang": "sr" are already in Serbian -> shown directly, never sent
 # through the translator (avoids garbling club names). Every URL below was
 # live-tested to actually return articles (homepage URLs return 0 in feedparser).
+# The operator must verify each feed's reuse terms; RSS attribution is not a
+# licence. Keep the stored material as a factual, attributed news brief.
 SPORTS_FEEDS = [
     # DOMAĆI TEREN - profesionalne domaće redakcije (već na srpskom)
-    {"name": "Sportski žurnal", "url": "http://www.zurnal.rs/rss", "lang": "sr"},
-    {"name": "Telegraf Sport", "url": "https://www.telegraf.rs/rss/sport", "lang": "sr"},
+    {"name": "Sportski žurnal", "url": "http://www.zurnal.rs/rss", "lang": "sr", "category": "football"},
+    {"name": "Telegraf Sport", "url": "https://www.telegraf.rs/rss/sport", "lang": "sr", "category": "football"},
     # EVROPSKI GIGANTI (La Liga, Serija A, Premijer liga, Liga šampiona, transferi)
-    {"name": "Marca (Španija)", "url": "https://e00-marca.uecdn.es/rss/futbol.xml", "lang": "es"},
-    {"name": "AS (Španija)", "url": "https://as.com/rss/futbol/portada.xml", "lang": "es"},
-    {"name": "Gazzetta (Italija)", "url": "https://www.gazzetta.it/rss/calcio.xml", "lang": "it"},
-    {"name": "Sky Sports (Engleska)", "url": "https://www.skysports.com/rss/12040", "lang": "en"},
-    {"name": "Football Italia", "url": "https://football-italia.net/feed/", "lang": "en"},
+    {"name": "Marca (Španija)", "url": "https://e00-marca.uecdn.es/rss/futbol.xml", "lang": "es", "category": "football"},
+    {"name": "AS (Španija)", "url": "https://as.com/rss/futbol/portada.xml", "lang": "es", "category": "football"},
+    {"name": "Gazzetta (Italija)", "url": "https://www.gazzetta.it/rss/calcio.xml", "lang": "it", "category": "football"},
+    {"name": "Sky Sports (Engleska)", "url": "https://www.skysports.com/rss/12040", "lang": "en", "category": "football"},
+    {"name": "Football Italia", "url": "https://football-italia.net/feed/", "lang": "en", "category": "football"},
     # KOŠARKA (NBA + Evroliga)
-    {"name": "Eurohoops", "url": "https://www.eurohoops.net/feed/", "lang": "en"},
-    {"name": "Sportando", "url": "https://sportando.basketball/en/feed/", "lang": "en"},
+    {"name": "Eurohoops", "url": "https://www.eurohoops.net/feed/", "lang": "en", "category": "basketball"},
+    {"name": "Sportando", "url": "https://sportando.basketball/en/feed/", "lang": "en", "category": "basketball"},
+    # TENIS
+    {"name": "ESPN Tennis", "url": "https://www.espn.com/espn/rss/tennis/news", "lang": "en", "category": "tennis"},
+    {"name": "ATP Tour", "url": "https://www.atptour.com/en/media/rss-feed", "lang": "en", "category": "tennis"},
+    # BOKS
+    {"name": "BoxingScene", "url": "https://www.boxingscene.com/rss/news.xml", "lang": "en", "category": "boxing"},
     # JUŽNOAMERIČKA MAGIJA (Argentina + Brazil)
     {"name": "Olé (Argentina)", "url": "https://www.ole.com.ar/rss/", "lang": "es"},
     {"name": "Clarín (Argentina)", "url": "https://www.clarin.com/rss/deportes/", "lang": "es"},
@@ -173,12 +184,6 @@ HIGH_PRIORITY_KEYWORDS = [
     "Transfer", "Fichaje", "Refuerzo", "Partizan",
     "Radnicki", "Radnički", "Vojvodina", "Voša", "Neymar", "Ronaldinho",
     "Jokic", "Jokić", "NBA", "champions", "Champions League",
-]
-
-# A SINGLE article carrying one of these is skipped (never the whole feed/site).
-JUNK_SPORT_WORDS = [
-    "triathlon", "triatlon", "cricket", "kriket", "críquet", "críquete",
-    "rugby", "ragbi", "rúgbi", "golf", "snooker", "snuker",
 ]
 
 BREAKING_NEWS_PATTERN = r"\bbreaking(?:\s*[:-]|\\s+news\b)"
@@ -310,15 +315,15 @@ AI_HEADLINE_SYSTEM_PROMPT = (
 )
 
 AI_BODY_SYSTEM_PROMPT = (
-    "You are a senior sports journalist writing for a major Serbian sports "
-    "portal (Mozzart Sport / Sportal / Arena Sport style). Given a short RSS "
-    "news brief plus its headline in Spanish, English, Italian or Portuguese: "
-    "1) Translate to Serbian and EXPAND it into a full, engaging, professional "
-    "article of 2-3 detailed paragraphs (~150 words). 2) Open with a strong "
-    "journalistic lead, add context and a closing outlook. 3) Localize football "
-    "slang into natural Serbian terminology. 4) Use these club names exactly: "
+    "You are a careful Serbian sports editor. Translate the supplied RSS material "
+    "into natural Serbian. Use ONLY facts explicitly present in the headline and "
+    "brief: never invent scores, dates, quotes, lineups, transfers, causes, context "
+    "or predictions. If the material is short, return a concise one-paragraph news "
+    "brief; do not pad it or pretend it is a full report. If the material is long, "
+    "you may organise it into clear paragraphs without adding facts. Localize only "
+    "football terminology that is actually present. Use these club names exactly: "
     "Crvena zvezda, Partizan, River Plejt, Boka Juniors, Njuels Old Bojs, "
-    "Radnički Kragujevac. 5) Never invent facts. 6) Output ONLY the article body."
+    "Radnički Kragujevac. Output ONLY the Serbian article body."
 )
 
 
@@ -342,6 +347,12 @@ CREATE TABLE IF NOT EXISTS articles (
                                         CHECK (status IN ('pending','published')),
     position           TEXT    NOT NULL DEFAULT 'standard'
                                         CHECK (position IN ('hero','trending','standard')),
+    category           TEXT    NOT NULL DEFAULT 'other',
+    content_type       TEXT    NOT NULL DEFAULT 'brief',
+    attempt_count      INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT    NOT NULL DEFAULT '',
+    last_attempt_at    TEXT,
+    next_retry_at      REAL,
     views              INTEGER NOT NULL DEFAULT 0
 )
 """
@@ -362,6 +373,12 @@ CREATE TABLE IF NOT EXISTS articles (
                                         CHECK (status IN ('pending','published')),
     position           TEXT    NOT NULL DEFAULT 'standard'
                                         CHECK (position IN ('hero','trending','standard')),
+    category           TEXT    NOT NULL DEFAULT 'other',
+    content_type       TEXT    NOT NULL DEFAULT 'brief',
+    attempt_count      INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT    NOT NULL DEFAULT '',
+    last_attempt_at    TEXT,
+    next_retry_at      REAL,
     views              INTEGER NOT NULL DEFAULT 0
 )
 """
@@ -371,20 +388,38 @@ def init_db() -> None:
     with _db_lock:
         if DB_DIALECT == "postgres":
             _db.execute(SCHEMA_SQL_POSTGRES)
-            # PostgreSQL migration for databases created by an older version.
-            _db.execute(
-                "ALTER TABLE articles ADD COLUMN IF NOT EXISTS position "
-                "TEXT NOT NULL DEFAULT 'standard'"
-            )
+            # PostgreSQL migrations for databases created by older versions.
+            for column_sql in (
+                "position TEXT NOT NULL DEFAULT 'standard'",
+                "category TEXT NOT NULL DEFAULT 'other'",
+                "content_type TEXT NOT NULL DEFAULT 'brief'",
+                "attempt_count INTEGER NOT NULL DEFAULT 0",
+                "last_error TEXT NOT NULL DEFAULT ''",
+                "last_attempt_at TEXT",
+                "next_retry_at DOUBLE PRECISION",
+            ):
+                column_name = column_sql.split()[0]
+                _db.execute(
+                    f"ALTER TABLE articles ADD COLUMN IF NOT EXISTS {column_name} {column_sql[len(column_name)+1:]}"
+                )
         else:
             _db.execute(SCHEMA_SQL_SQLITE)
-            # SQLite migration for any pre-existing table without `position`.
+            # SQLite migration for any pre-existing table without new metadata.
             cols = {row[1] for row in _db.execute("PRAGMA table_info(articles)")}
-            if "position" not in cols:
-                _db.execute(
-                    "ALTER TABLE articles ADD COLUMN position "
-                    "TEXT NOT NULL DEFAULT 'standard'"
-                )
+            migrations = {
+                "position": "TEXT NOT NULL DEFAULT 'standard'",
+                "category": "TEXT NOT NULL DEFAULT 'other'",
+                "content_type": "TEXT NOT NULL DEFAULT 'brief'",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_error": "TEXT NOT NULL DEFAULT ''",
+                "last_attempt_at": "TEXT",
+                "next_retry_at": "REAL",
+            }
+            for column_name, column_type in migrations.items():
+                if column_name not in cols:
+                    _db.execute(
+                        f"ALTER TABLE articles ADD COLUMN {column_name} {column_type}"
+                    )
         _db.commit()
 
 
@@ -418,20 +453,56 @@ def _format_date(entry: Any) -> str:
     return entry.get("published") or entry.get("updated") or "Unknown date"
 
 
+def _feed_text_values(entry: Any) -> list[str]:
+    """Collect text exposed by common RSS/Atom fields.
+
+    feedparser normalises ``content:encoded`` to ``content_encoded`` for many
+    feeds, while other feeds leave it under the literal key. Some feeds expose
+    ``content`` as a list of dictionaries. Keep every usable candidate and let
+    the caller select the longest one instead of assuming ``summary`` is best.
+    """
+    values: list[str] = []
+    for key in ("content", "content_encoded", "content:encoded", "description", "summary"):
+        raw = entry.get(key)
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, dict):
+                    raw_value = item.get("value") or item.get("content") or item.get("text")
+                else:
+                    raw_value = item
+                cleaned = clean_text(str(raw_value or ""))
+                if cleaned:
+                    values.append(cleaned)
+        elif isinstance(raw, dict):
+            cleaned = clean_text(str(raw.get("value") or raw.get("content") or ""))
+            if cleaned:
+                values.append(cleaned)
+        else:
+            cleaned = clean_text(str(raw or ""))
+            if cleaned:
+                values.append(cleaned)
+    # A feed can repeat the same content under summary and description.
+    return list(dict.fromkeys(values))
+
+
+def _content_type_for_source(text: str) -> str:
+    """Classify source material, not generated prose, as full or brief."""
+    words = re.findall(r"\w+", text or "", flags=re.UNICODE)
+    sentences = len(re.findall(r"[.!?](?:\s|$)", text or ""))
+    return "full" if len(text or "") >= 320 and (len(words) >= 55 or sentences >= 3) else "brief"
+
+
 def parse_entry(entry: Any, source: str) -> dict:
+    candidates = _feed_text_values(entry)
+    summary = max(candidates, key=len, default="")
     return {
         "source": source,
         "title": clean_text(entry.get("title")),
         "link": entry.get("link", ""),
         "published": _format_date(entry),
-        "summary": clean_text(entry.get("summary") or entry.get("description")),
+        "summary": summary,
+        "content_type": _content_type_for_source(summary),
     }
-
-
-def is_junk_sport(title: str, summary: str) -> bool:
-    """True if THIS SINGLE article is about a sport we don't cover."""
-    text = f"{title or ''} {summary or ''}".lower()
-    return any(re.search(rf"\b{re.escape(w)}\b", text) for w in JUNK_SPORT_WORDS)
 
 
 def calculate_priority(title: str, summary: str) -> int:
@@ -684,10 +755,14 @@ def fetch_all_feeds(feeds: list[dict] | None = None) -> tuple[int, int]:
                 art = parse_entry(entry, source)
                 if not art["link"]:
                     continue
-                if is_junk_sport(art["title"], art["summary"]):
-                    skipped += 1                 # drop ONLY this single article
-                    continue
+                # Unsupported sports are intentionally retained and routed
+                # to the extensible "Ostalo" category instead of being lost.
                 art["priority"] = calculate_priority(art["title"], art["summary"])
+                feed_category = feed.get("category")
+                art["category"] = (
+                    feed_category if feed_category in CATEGORY_LABELS
+                    else classify_category(art["title"], art["summary"], source)
+                )
                 art["lang"] = lang
                 batch.append(art)
 
@@ -702,10 +777,12 @@ def fetch_all_feeds(feeds: list[dict] | None = None) -> tuple[int, int]:
                     _db.execute(
                         """INSERT INTO articles
                            (source, original_title, original_summary, link,
-                            published_date, source_lang, priority, status)
-                           VALUES (?,?,?,?,?,?,?, 'pending')""",
+                            published_date, source_lang, priority, category,
+                            content_type, status)
+                           VALUES (?,?,?,?,?,?,?,?,?, 'pending')""",
                         (art["source"], art["title"], art["summary"], art["link"],
-                         art["published"], art["lang"], art["priority"]),
+                         art["published"], art["lang"], art["priority"],
+                         art["category"], art["content_type"]),
                     )
                     new += 1
                 _db.commit()
@@ -715,20 +792,57 @@ def fetch_all_feeds(feeds: list[dict] | None = None) -> tuple[int, int]:
     return new, skipped
 
 
-def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, int]:
-    """Translate/generate up to `limit` pending articles; autopilot-publish hot ones.
+def _generated_text(text: str, headline: bool = False) -> str:
+    """Normalise model/translator output while keeping article paragraphs."""
+    text = html.unescape((text or "").replace("\r\n", "\n")).strip()
+    parts = []
+    for part in re.split(r"\n\s*\n+", text):
+        part = re.sub(r"\s+", " ", part).strip(" -*\t")
+        if part:
+            parts.append(part)
+    return "\n\n".join(parts)
 
-    Serbian-source articles are copied through directly (no network call) so club
-    names are never mangled.
+
+def _translate_short_brief(text: str) -> str:
+    """Translate a short RSS brief without asking AI to invent an article."""
+    return localize_post(_translate_free(localize_pre(text)))
+
+
+def _validate_article_output(title: str, body: str) -> None:
+    if len((title or "").strip()) < 5:
+        raise RuntimeError("prevod naslova je prazan ili prekratak")
+    if len((body or "").strip()) < 12:
+        raise RuntimeError("prevod sadržaja je prazan ili prekratak")
+    if _looks_like_error_page(body) or _looks_like_error_page(title):
+        raise RuntimeError("prevod liči na stranicu greške")
+
+
+def _retry_delay(attempt_count: int) -> float:
+    # Cron normally runs every ten minutes: failed work is retained but does
+    # not hammer a provider on every request. It eventually retries hourly.
+    return min(3600.0, 30.0 * (2 ** min(max(attempt_count - 1, 0), 7)))
+
+
+def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, int]:
+    """Process at most ``limit`` due rows, retaining failures for retry.
+
+    Short RSS entries are published as explicitly brief, factual items. They
+    are never fed to the expansion prompt as if they contained facts that are
+    not present in the feed. Longer permitted RSS material may be expanded by
+    AI, but only a quality-checked result is published.
     """
+    now = time.time()
     with _db_lock:
         rows = _db.execute(
-            """SELECT id, source, original_title, original_summary, priority, source_lang
+            """SELECT id, source, original_title, original_summary, priority,
+                      source_lang, category, content_type, attempt_count
                FROM articles
-               WHERE translated_title = '' AND translated_summary = ''
-               ORDER BY published_date DESC, id DESC
+               WHERE status='pending'
+                 AND (translated_title = '' OR translated_summary = '')
+                 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+               ORDER BY priority DESC, published_date DESC, id DESC
                LIMIT ?""",
-            (limit,),
+            (now, limit),
         ).fetchall()
 
     if not rows:
@@ -737,42 +851,69 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
     translated = failed = 0
     for row in rows:
         article_id = row["id"]
+        attempt_count = int(row["attempt_count"] or 0) + 1
+        attempt_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        with _db_lock:
+            _db.execute(
+                """UPDATE articles
+                   SET attempt_count=?, last_attempt_at=?, last_error=''
+                   WHERE id=?""",
+                (attempt_count, attempt_at, article_id),
+            )
+            _db.commit()
+
         try:
-            # In AI mode, foreign feeds (Marca/Sky/Ole) often have an empty or
-            # very short summary (<30 chars). Feed Gemini the TITLE so it can
-            # write a full 2-3 paragraph article from the headline alone.
-            ai_body_material = row["original_summary"] or ""
-            if TRANSLATION_MODE == "ai" and len(ai_body_material.strip()) < 30:
-                ai_body_material = row["original_title"]
+            original_title = (row["original_title"] or "").strip()
+            original_summary = (row["original_summary"] or "").strip()
+            source_material = original_summary or original_title
+            source_type = row["content_type"] or _content_type_for_source(source_material)
 
             if row["source_lang"] == "sr":
-                # Ako je TRANSLATION_MODE postavljen na "ai", šaljemo i domaću
-                # vest na proširivanje u 2-3 pasusa (naslov ostaje izvoran).
-                if TRANSLATION_MODE == "ai" and os.environ.get("GEMINI_API_KEY"):
-                    tr_title = localize_post(row["original_title"])
-                    # Ugrađeni AI novinar od naslova/jedne rečenice pravi ceo članak.
-                    tr_summary = translate_text(
-                        ai_body_material, is_headline=False,
-                        source_headline=row["original_title"])
-                else:
-                    # Već na srpskom -> prikaži direktno, samo lokalno srediti imena.
-                    tr_title = localize_post(row["original_title"])
-                    tr_summary = (
-                        localize_post(row["original_summary"])
-                        if row["original_summary"] else ""
-                    )
+                tr_title = localize_post(original_title)
+                tr_summary = localize_post(original_summary) if original_summary else tr_title
             else:
-                tr_title = translate_text(row["original_title"], is_headline=True,
-                                          source_headline=row["original_title"])
-                tr_summary = (
-                    translate_text(ai_body_material, is_headline=False,
-                                   source_headline=row["original_title"])
-                    if ai_body_material else ""
+                # Short material gets ordinary translation for both title and
+                # body. This is the important anti-hallucination branch for
+                # 10–15 word RSS feeds: no AI headline embellishment either.
+                if len(source_material) < 80:
+                    tr_title = _translate_short_brief(original_title)
+                    tr_summary = (
+                        tr_title if source_material == original_title
+                        else _translate_short_brief(source_material)
+                    )
+                else:
+                    tr_title = translate_text(
+                        original_title, is_headline=True, source_headline=original_title,
+                    )
+                    if TRANSLATION_MODE == "ai":
+                        tr_summary = translate_text(
+                            source_material, is_headline=False,
+                            source_headline=original_title,
+                        )
+                    else:
+                        tr_summary = _translate_short_brief(source_material)
+
+            tr_title = _generated_text(localize_post(tr_title), headline=True)
+            tr_summary = _generated_text(localize_post(tr_summary))
+            if not tr_summary:
+                # A title-only RSS item remains visible as a short item, rather
+                # than being falsely presented as a detailed report.
+                tr_summary = tr_title
+            if source_type == "full" and len(tr_summary) < 80:
+                raise RuntimeError(
+                    "prevod dužeg RSS sadržaja je prekratak; vest ostaje za retry"
                 )
-            # AUTOMATIC publishing: every translated article goes live. A
-            # Zvezda (priority=2) article auto-claims the Hero slot and demotes
-            # the previous hero; everything else lands as a standard card.
-            # With AUTOPILOT_PUBLISH=0 everything stays 'pending' for approval.
+            _validate_article_output(tr_title, tr_summary)
+
+            category = row["category"] if row["category"] in CATEGORY_LABELS else "other"
+            if category == "other":
+                category = classify_category(original_title, original_summary, row["source"])
+            content_type = (
+                "full" if source_type == "full" and len(tr_summary) >= 280 else "brief"
+            )
+
+            # AUTOMATIC publishing stays enabled by default. Manual hero and
+            # legacy 'trending' placement remain separate from view ranking.
             if AUTOPILOT_PUBLISH:
                 status = "published"
                 position = "hero" if row["priority"] == 2 else "standard"
@@ -786,23 +927,41 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
                         "WHERE position='hero' AND id != ?", (article_id,))
                 _db.execute(
                     """UPDATE articles
-                       SET translated_title = ?, translated_summary = ?,
-                           status = ?, position = ?
-                       WHERE id = ?""",
-                    (tr_title, tr_summary, status, position, article_id),
+                       SET translated_title=?, translated_summary=?,
+                           category=?, content_type=?, status=?, position=?,
+                           last_error='', next_retry_at=NULL
+                       WHERE id=?""",
+                    (tr_title, tr_summary, category, content_type, status,
+                     position, article_id),
                 )
                 _db.commit()
             translated += 1
             tag = "PUBLISHED" if status == "published" else "pending"
-            print(f"[TRANSLATE] #{article_id} [{row['source']}] {tag}: {tr_title[:60]}")
+            print(
+                f"[TRANSLATE] #{article_id} [{row['source']}] {tag}/"
+                f"{content_type}: {tr_title[:60]}"
+            )
             if row["source_lang"] != "sr" and TRANSLATION_MODE == "free":
                 time.sleep(0.5)
         except Exception as exc:
             failed += 1
-            print(f"[TRANSLATE][ERROR] #{article_id}: {exc}")
+            retry_at = time.time() + _retry_delay(attempt_count)
+            error_text = str(exc).replace("\n", " ")[:500]
+            with _db_lock:
+                _db.execute(
+                    """UPDATE articles
+                       SET translated_title='', translated_summary='',
+                           last_error=?, next_retry_at=?, status='pending'
+                       WHERE id=?""",
+                    (error_text, retry_at, article_id),
+                )
+                _db.commit()
+            print(
+                f"[TRANSLATE][ERROR] #{article_id} attempt={attempt_count}; "
+                f"retry in {int(_retry_delay(attempt_count))}s: {error_text}"
+            )
     print(f"[TRANSLATE] cycle done: {translated} ok, {failed} failed")
     return translated, failed
-
 
 def run_fetcher_cycle() -> None:
     """Run the legacy background cycle, but never overlap another cycle."""
@@ -850,32 +1009,59 @@ def start_background_fetcher() -> None:
 #  DYNAMIC IMAGERY / CATEGORIES / LOCAL-CLUB BADGES
 # =========================================================================== #
 
-_BASKETBALL_KEYWORDS = [
-    "nba", "jokic", "jokić", "basketball", "košarka", "kosarka",
-    "košarkašk", "kosarkask", "košarkaš", "kosarkas", "basket",
-    "evroliga", "evrolige", "euroleague", "euroleague", "evrokup",
+# The registry is deliberately data-driven: adding a new sport means adding one
+# entry here and one keyword list, not rewriting the homepage route/template.
+CATEGORY_CONFIG = [
+    {"key": "football", "label": "Fudbal", "emoji": "⚽", "anchor": "fudbal", "detect_order": 40},
+    {"key": "basketball", "label": "Košarka", "emoji": "🏀", "anchor": "kosarka", "detect_order": 10},
+    {"key": "tennis", "label": "Tenis", "emoji": "🎾", "anchor": "tenis", "detect_order": 20},
+    {"key": "boxing", "label": "Boks", "emoji": "🥊", "anchor": "boks", "detect_order": 30},
+    {"key": "other", "label": "Ostalo", "emoji": "🏆", "anchor": "ostalo", "detect_order": 100},
 ]
-_FOOTBALL_KEYWORDS = [
-    "football", "soccer", "fudbal", "fudbalsk", "messi", "maradona",
-    "boca juniors", "boka juniors", "boka", "river plej t", "river plej",
-    "plejt", "xeneize", "river plate", "lanus", "lanús", "velez", "vélez",
-    "real madrid", "liverpool", "barselona", "barcelona", "psg", "fichaje",
-    "refuerzo", "transfer", "gol", "utakmica", "meč", "premier league",
-    "la liga", "serija a", "clausura", "klauzura", "libertadores",
-    "sudamericana", "golman", "kapiten", "trener", "derbi", "prelazni rok",
-    "fudbalska pijaca", "ofšajd", "napad", "odbrana",
-    "radnicki", "radnički", "radničkog", "radničkom", "radnički 1923",
-    "radnicki kragujevac", "radnički kragujevac", "crvena zvezda", "zvezda",
-    "partizan", "kragujevac", "kragujevcu", "vojvodina", "vojvodine",
-    "vojvodini", "vojvodinom", "vosa", "voša", "voše", "cika daca",
-    "čika dača", "đavoli", "davoli", "superliga", "novosađani",
-    "novosadjani", "novosađana", "radnicki nis", "radnički niš",
-    "radnički iz niša", "nišava", "čair", "novi pazar", "novog pazara",
-    "novom pazaru", "novim pazarom", "pazarci",
-    "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao", "estêvão",
-    "messinho", "flamengo", "palmeiras", "santos",
-    "sao paulo", "são paulo", "fluminense",
-]
+CATEGORY_LABELS = {item["key"]: item["label"] for item in CATEGORY_CONFIG}
+CATEGORY_EMOJIS = {item["key"]: item["emoji"] for item in CATEGORY_CONFIG}
+
+# Keep category signals specific. Generic words such as "meč", "trener",
+# "napad" and "odbrana" are intentionally absent because they misclassify
+# tennis, boxing and other sports as football.
+_CATEGORY_KEYWORDS = {
+    "basketball": [
+        "nba", "wnba", "basketball", "košarka", "kosarka", "košarkašk",
+        "kosarkask", "košarkaš", "kosarkas", "basket", "evroliga",
+        "evrolige", "euroleague", "evrokup", "fiba", "ncaa basketball",
+    ],
+    "tennis": [
+        "tennis", "tenis", "atp", "wta", "itf tennis", "grand slam",
+        "wimbledon", "roland garros", "us open", "australian open",
+        "french open", "cincinnati open", "masters 1000", "davis cup",
+        "fed cup", "bekhend", "forhend", "brejk lopta",
+        "break point", "setova", "teniski teren",
+    ],
+    "boxing": [
+        "boxing", "boks", "bokser", "bokseri", "bokserski", "ring",
+        "nokaut", "nokautirao", "nokautiran", "knockout", "ko pobeda",
+        "wbc", "wba", "ibf", "wbo", "ufc", "mma", "teška kategorija",
+        "teska kategorija", "velter", "superteška", "superteska",
+    ],
+    "football": [
+        "football", "soccer", "fudbal", "fudbalsk", "messi", "maradona",
+        "boca juniors", "boka juniors", "river plej", "river plate", "xeneize",
+        "millonario", "real madrid", "liverpool", "barselona", "barcelona",
+        "manchester", "chelsea", "arsenal", "psg", "premier league", "la liga",
+        "serija a", "serie a", "bundesliga", "clausura", "klauzura",
+        "libertadores", "sudamericana", "golman", "golova", "golovima",
+        "ofšajd", "ofsajd", "corner", "korner", "penal", "jedanaesterac",
+        "kapiten", "derbi", "prelazni rok", "fudbalska pijaca", "transfer",
+        "fichaje", "refuerzo", "superliga", "radnički", "radnicki", "vojvodina",
+        "vosa", "voša", "čika dača", "cika daca", "đavoli", "davoli",
+        "radnički niš", "radnicki nis", "nišava", "čair", "novi pazar",
+        "partizan", "crvena zvezda", "zvezda", "kragujevac", "kragujevcu",
+        "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao",
+        "estêvão", "messinho", "flamengo", "palmeiras", "santos", "sao paulo",
+        "são paulo", "fluminense", "brasileirao", "brasileirão",
+    ],
+}
+
 _SOUTH_AMERICA_KEYWORDS = [
     "boka", "boca", "river plej", "plejt", "xeneize", "millonario",
     "boca juniors", "boka juniors", "river plate", "lanús", "lanus",
@@ -883,17 +1069,35 @@ _SOUTH_AMERICA_KEYWORDS = [
     "estudiantes", "bombonera", "clausura", "klauzura", "libertadores",
     "sudamericana", "gaucho", "gaučo", "gaučos", "karioka", "karioke",
     "tango", "samba", "argentina", "argentinski", "brazil", "brazilu",
-    "brazilski", "brazilskom",
-    "messi", "maradona", "tevez", "riquelme", "gallardo",
-    "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao",
-    "estêvão", "messinho", "flamengo", "palmeiras", "santos",
-    "sao paulo", "são paulo", "fluminense", "brasileirao", "brasileirão",
-    "njujels", "ole", "clarin", "globo",
+    "brazilski", "brazilskom", "messi", "maradona", "tevez", "riquelme",
+    "gallardo", "neymar", "ronaldinho", "pelé", "pele", "endrick", "estevao",
+    "estêvão", "messinho", "flamengo", "palmeiras", "santos", "sao paulo",
+    "são paulo", "fluminense", "brasileirao", "brasileirão", "njujels", "ole",
+    "clarin", "globo",
 ]
 
-# Offline fallback images (inline SVG) used when Google Image Search is not
-# configured (no GOOGLE_API_KEY / GOOGLE_CX) or when the API call fails.
-_FALLBACK_EMOJI = {"football": "⚽", "basketball": "🏀", "general": "🏆"}
+
+def _keyword_hit(text: str, keyword: str) -> bool:
+    """Accent-tolerant-ish phrase match without broad substring accidents."""
+    return keyword.lower() in text.lower()
+
+
+def classify_category(title: str, summary: str, source: str = "") -> str:
+    text = f"{source} {title} {summary}".lower()
+    # Specific categories win first, so a tennis/boxing article containing a
+    # generic football word in a quote or tag cannot fall into football. The
+    # order comes from the registry, so new sports can be added without
+    # changing this function.
+    for config in sorted(CATEGORY_CONFIG, key=lambda item: item.get("detect_order", 100)):
+        category = config["key"]
+        keywords = _CATEGORY_KEYWORDS.get(category, [])
+        if any(_keyword_hit(text, keyword) for keyword in keywords):
+            return category
+    return "other"
+
+# Offline fallback images (inline SVG) used by default. External image search
+# is never assumed to grant republication rights and is opt-in below.
+_FALLBACK_EMOJI = {"football": "⚽", "basketball": "🏀", "tennis": "🎾", "boxing": "🥊", "other": "🏆", "general": "🏆"}
 
 
 def _fallback_image(category: str) -> str:
@@ -953,20 +1157,19 @@ def article_image(article) -> str:
 
     result = _fallback_image(category)
     query = (title or category).strip()
-    try:
-        found = _google_image_url(query)
-        if found:
-            result = found
-    except Exception as exc:
-        print(f"[IMAGE] Google image search nije dostupan ({query[:40]}...): {exc}")
+    if ALLOW_EXTERNAL_IMAGES:
+        try:
+            found = _google_image_url(query)
+            if found:
+                result = found
+        except Exception as exc:
+            print(f"[IMAGE] Google image search nije dostupan ({query[:40]}...): {exc}")
 
     if article_id is not None:
         with _image_cache_lock:
             _image_cache[article_id] = result
     return result
 
-
-CATEGORY_LABELS = {"football": "Fudbal", "basketball": "Košarka", "general": "Sport"}
 
 LOCAL_CLUBS = [
     {"label": "Radnički KG", "css": "club-kg",
@@ -997,12 +1200,24 @@ def article_text_blob(article) -> str:
 
 
 def article_category(article) -> str:
+    """Read persisted category; infer safely for legacy rows.
+
+    Older records had no category column (or used ``general``). They are
+    reclassified from their text at render time, while new RSS rows persist the
+    result at ingestion so later keyword edits do not move them unexpectedly.
+    """
+    try:
+        stored = article["category"]
+    except (KeyError, IndexError, TypeError):
+        stored = ""
+    if stored in CATEGORY_LABELS and stored != "other":
+        return stored
     text = article_text_blob(article)
-    if any(k in text for k in _BASKETBALL_KEYWORDS):
-        return "basketball"
-    if any(k in text for k in _FOOTBALL_KEYWORDS):
-        return "football"
-    return "general"
+    return classify_category(
+        article.get("original_title", "") if hasattr(article, "get") else "",
+        article.get("original_summary", "") if hasattr(article, "get") else "",
+        article.get("source", "") if hasattr(article, "get") else text,
+    )
 
 
 def is_south_america(article) -> bool:
@@ -1267,7 +1482,7 @@ PUBLIC_TEMPLATE = """
 <html lang="sr">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sportske vesti &#8211; Sportski Portal</title>
+  <title>{{ view_title }} &#8211; Sportski Portal</title>
   <style>{{ css|safe }}</style>
 </head>
 <body>
@@ -1278,7 +1493,9 @@ PUBLIC_TEMPLATE = """
       <img src="{{ article_image(a) }}" alt="{{ a.translated_title }}"
            loading="{{ 'eager' if eager else 'lazy' }}" onerror="this.style.opacity='0'">
       <span class="chip">{{ category_label(a) }}</span>
+      {% if a.content_type != 'full' %}<span class="chip">Kratka vest</span>{% endif %}
       {% if rank %}<span class="badge-trending">&#128293; Naj&#269;itanije</span>
+      {% elif a.position == 'trending' %}<span class="badge-trending">&#128293; Ru&#269;no istaknuto</span>
       {% elif a.priority == 2 %}<span class="badge-star">&#11088; Zvezda</span>
       {% elif a.priority == 1 %}<span class="badge-hot">&#9889;</span>{% endif %}
       {% if rank %}<span class="card-rank">{{ rank }}</span>{% endif %}
@@ -1312,8 +1529,12 @@ PUBLIC_TEMPLATE = """
           <span></span><span></span><span></span>
         </button>
         <div class="nav-dropdown" id="navDropdown">
+          <a href="{{ url_for('most_read') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128293;</span> Naj&#269;itanije</a>
           <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
           <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
+          <a href="{{ url_for('index') }}#tenis" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127934;</span> Tenis</a>
+          <a href="{{ url_for('index') }}#boks" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#129354;</span> Boks</a>
+          <a href="{{ url_for('index') }}#ostalo" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127942;</span> Ostalo</a>
           <a href="{{ url_for('index') }}#juzna-amerika" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#10024;</span> Ju&#382;na Amerika</a>
           <a href="{{ url_for('index') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127968;</span> Po&#269;etna</a>
         </div>
@@ -1322,7 +1543,7 @@ PUBLIC_TEMPLATE = """
   </header>
 
   <main class="container">
-    {% if hero or trending or football or basketball or south_america %}
+    {% if hero or trending or category_sections or south_america %}
 
       {% if hero %}
       <div class="hero-head section-head">
@@ -1337,6 +1558,7 @@ PUBLIC_TEMPLATE = """
             {% if hero.priority == 2 %}<span class="badge-star">&#11088; Crvena zvezda &#8211; udarna vest</span>
             {% else %}<span class="badge-hot">&#9889; Udarna vest</span>{% endif %}
             <span class="chip">{{ category_label(hero) }}</span>
+            {% if hero.content_type != 'full' %}<span class="chip">Kratka vest</span>{% endif %}
             {% for club in club_badges(hero) %}<span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>{% endfor %}
             <span class="chip">&#128065; {{ hero.views or 0 }}</span>
           </div>
@@ -1350,26 +1572,26 @@ PUBLIC_TEMPLATE = """
       </a>
       {% endif %}
 
+      {% if is_most_read %}
+      <div class="hero-head section-head" style="margin-top:26px;">
+        <h1 style="font-size:1.65rem;">{{ view_title }}</h1><span class="line"></span>
+      </div>
+      {% if view_intro %}<p style="color:var(--muted); margin:-8px 0 22px;">{{ view_intro }}</p>{% endif %}
+      {% endif %}
+
       {% if trending %}
       <section class="grid-section">
-        <div class="section-head"><h3><span class="emoji">&#128293;</span>NAJ&#268;ITANIJE</h3><span class="line"></span></div>
+        {% if not is_most_read %}<div class="section-head"><h3><span class="emoji">&#128293;</span>NAJ&#268;ITANIJE</h3><span class="line"></span></div>{% endif %}
         <div class="grid">{% for a in trending %}{{ card(a, eager=(loop.index==1), rank=loop.index) }}{% endfor %}</div>
       </section>
       {% endif %}
 
-      {% if football %}
-      <section class="grid-section" id="fudbal">
-        <div class="section-head"><h3><span class="emoji">&#9917;</span>DOMA&#262;I TEREN &amp; EVROPSKI GIGANTI</h3><span class="line"></span></div>
-        <div class="grid">{% for a in football %}{{ card(a) }}{% endfor %}</div>
+      {% for section in category_sections %}
+      <section class="grid-section" id="{{ section.anchor }}">
+        <div class="section-head"><h3><span class="emoji">{{ section.emoji }}</span>{{ section.label }}</h3><span class="line"></span></div>
+        <div class="grid">{% for a in section.articles %}{{ card(a) }}{% endfor %}</div>
       </section>
-      {% endif %}
-
-      {% if basketball %}
-      <section class="grid-section" id="kosarka">
-        <div class="section-head"><h3><span class="emoji">&#127936;</span>KO&#352;ARKA</h3><span class="line"></span></div>
-        <div class="grid">{% for a in basketball %}{{ card(a) }}{% endfor %}</div>
-      </section>
-      {% endif %}
+      {% endfor %}
 
       {% if south_america %}
       <section class="grid-section" id="juzna-amerika">
@@ -1413,8 +1635,12 @@ ARTICLE_DETAIL_TEMPLATE = """
           <span></span><span></span><span></span>
         </button>
         <div class="nav-dropdown" id="navDropdown">
+          <a href="{{ url_for('most_read') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128293;</span> Naj&#269;itanije</a>
           <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
           <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
+          <a href="{{ url_for('index') }}#tenis" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127934;</span> Tenis</a>
+          <a href="{{ url_for('index') }}#boks" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#129354;</span> Boks</a>
+          <a href="{{ url_for('index') }}#ostalo" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127942;</span> Ostalo</a>
           <a href="{{ url_for('index') }}#juzna-amerika" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#10024;</span> Ju&#382;na Amerika</a>
           <a href="{{ url_for('index') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127968;</span> Po&#269;etna</a>
         </div>
@@ -1431,6 +1657,7 @@ ARTICLE_DETAIL_TEMPLATE = """
       <div class="article-inner">
         <div class="article-tags">
           <span class="chip">{{ category_label(a) }}</span>
+          {% if a.content_type != 'full' %}<span class="chip">Kratka vest</span>{% endif %}
           {% if a.priority == 2 %}<span class="badge-star">&#11088; Crvena zvezda</span>
           {% elif a.priority == 1 %}<span class="badge-hot">&#9889; Udarna vest</span>{% endif %}
           {% for club in club_badges(a) %}<span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>{% endfor %}
@@ -1550,8 +1777,11 @@ ADMIN_TEMPLATE = """
             {% for a in pending %}
             <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
                href="{{ url_for('admin', article_id=a['id']) }}">
-              <div class="pi-title">{{ a.translated_title }}{% if a.priority == 2 %} <span class="badge-star">&#11088;</span>{% elif a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
-              <div class="pi-meta meta">{{ a.source }}</div>
+              <div class="pi-title">{{ a.translated_title or a.original_title }}{% if a.priority == 2 %} <span class="badge-star">&#11088;</span>{% elif a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
+              <div class="pi-meta meta">
+                <span>{{ a.source }}</span>
+                {% if a.last_error %}<span style="color:#fca5a5;">&#9888; poku&#353;aj {{ a.attempt_count or 0 }}</span>{% endif %}
+              </div>
             </a>
             {% endfor %}
           {% else %}
@@ -1591,6 +1821,14 @@ ADMIN_TEMPLATE = """
           <div class="orig-label">Original &mdash; {{ selected.source }}</div>
           <strong>{{ selected.original_title }}</strong>
           <p>{{ selected.original_summary }}</p>
+          <div class="pi-meta meta" style="margin-top:10px;">
+            <span>Kategorija: {{ category_label(selected) }}</span>
+            <span>Tip sadržaja: {{ 'duža vest' if selected.content_type == 'full' else 'kratka vest' }}</span>
+            {% if selected.attempt_count %}<span>Pokušaji: {{ selected.attempt_count }}</span>{% endif %}
+          </div>
+          {% if selected.last_error %}
+          <p style="color:#fca5a5; margin-top:10px;">Poslednja greška: {{ selected.last_error }}. Vest ostaje sačuvana za automatski retry.</p>
+          {% endif %}
         </div>
         <form method="post" action="{{ url_for('publish_article', article_id=selected.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1611,7 +1849,7 @@ ADMIN_TEMPLATE = """
               <input type="radio" name="position" value="trending"
                      {{ 'checked' if selected.position == 'trending' else '' }}>
               <span class="pos-ico">&#128293;</span>
-              <span class="pos-text"><b>Naj&#269;itanije / Trending</b><small>Traka sa tri istaknute vesti</small></span>
+              <span class="pos-text"><b>Ru&#269;no istaknuta vest</b><small>Uredni&#269;ka oznaka; ne uti&#269;e na Naj&#269;itanije rangiranje</small></span>
             </label>
             <label class="pos-opt">
               <input type="radio" name="position" value="standard"
@@ -1656,52 +1894,85 @@ ADMIN_TEMPLATE = """
 #  ROUTES
 # =========================================================================== #
 
+def _published_articles(order_by_views: bool = False, limit: int | None = None):
+    sql = """SELECT id, source, original_title, original_summary, link,
+                     translated_title, translated_summary, published_date,
+                     priority, position, category, content_type, views
+              FROM articles WHERE status='published'"""
+    if order_by_views:
+        sql += " ORDER BY views DESC, published_date DESC, id DESC"
+    else:
+        sql += " ORDER BY published_date DESC, id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+    with _db_lock:
+        return _db.execute(sql, (limit,) if limit is not None else ()).fetchall()
+
+
+def _category_sections(articles, excluded_ids: set[int] | None = None) -> list[dict]:
+    excluded_ids = excluded_ids or set()
+    sections = []
+    for config in CATEGORY_CONFIG:
+        section_articles = [
+            article for article in articles
+            if article["id"] not in excluded_ids
+            and article_category(article) == config["key"]
+        ]
+        if section_articles:
+            sections.append({**config, "articles": section_articles})
+    return sections
+
+
 @app.route("/")
 def index():
-    db = get_db()
-    with _db_lock:
-        articles = db.execute(
-            """SELECT id, source, original_title, original_summary, link,
-                      translated_title, translated_summary, published_date,
-                      priority, position, views
-               FROM articles WHERE status='published'
-               ORDER BY published_date DESC, id DESC"""
-        ).fetchall()
+    articles = _published_articles()
 
-        # --- Hero: ONLY the article the editor set to position='hero' ---
-        hero = next((a for a in articles if a["position"] == "hero"), None)
-        # Fallback (nothing placed yet): freshest Zvezda (p=2), then high (p=1).
-        if hero is None:
-            hero = next((a for a in articles if a["priority"] == 2), None) or \
-                next((a for a in articles if a["priority"] == 1), None)
-        hero_id = hero["id"] if hero else None
+    # Hero/featured placement is editorial and independent of view ranking.
+    hero = next((a for a in articles if a["position"] == "hero"), None)
+    if hero is None:
+        hero = next((a for a in articles if a["priority"] == 2), None) or \
+            next((a for a in articles if a["priority"] == 1), None)
+    hero_id = hero["id"] if hero else None
 
-        # --- Trending: editor-picked position='trending' (max 3) ---
-        picked_trending = [a for a in articles
-                           if a["position"] == "trending" and a["id"] != hero_id][:3]
-        used = {a["id"] for a in picked_trending}
-        if hero_id is not None:
-            used.add(hero_id)
-        remaining = [a for a in articles if a["id"] not in used]
-        # Fill up to 3 with most-viewed articles if fewer than 3 were picked.
-        auto_trending = sorted(
-            remaining,
-            key=lambda a: (a["views"] or 0, a["published_date"] or "", a["id"]),
-            reverse=True,
-        )[:max(0, 3 - len(picked_trending))]
-        trending = picked_trending + auto_trending
-
-        featured_ids = ({hero_id} if hero_id is not None else set()) | {a["id"] for a in trending}
-        rest = [a for a in articles if a["id"] not in featured_ids]
-        basketball = [a for a in rest if article_category(a) == "basketball"]
-        south_america = [a for a in rest if is_south_america(a)]
-        sa_ids = {a["id"] for a in south_america}
-        football = [a for a in rest
-                    if article_category(a) == "football" and a["id"] not in sa_ids]
+    # Najčitanije is always a view-based ranking. Legacy position='trending'
+    # values are not consulted here; they remain only a manual placement hint.
+    ranked = sorted(
+        (a for a in articles if a["id"] != hero_id),
+        key=lambda a: (a["views"] or 0, a["published_date"] or "", a["id"]),
+        reverse=True,
+    )
+    trending = ranked[:3]
+    featured_ids = ({hero_id} if hero_id is not None else set()) | {a["id"] for a in trending}
+    category_sections = _category_sections(articles, featured_ids)
+    south_america = [
+        a for a in articles
+        if a["id"] not in featured_ids and is_south_america(a)
+    ]
+    south_ids = {a["id"] for a in south_america}
+    category_sections = [
+        {**section, "articles": [a for a in section["articles"] if a["id"] not in south_ids]}
+        for section in category_sections
+    ]
+    category_sections = [section for section in category_sections if section["articles"]]
 
     return render_template_string(
-        PUBLIC_TEMPLATE, hero=hero, trending=trending, football=football,
-        basketball=basketball, south_america=south_america, css=BASE_CSS,
+        PUBLIC_TEMPLATE, hero=hero, trending=trending,
+        category_sections=category_sections, south_america=south_america,
+        view_title="Sportske vesti", view_intro="", is_most_read=False,
+        css=BASE_CSS,
+    )
+
+
+@app.route("/najcitanije")
+def most_read():
+    """Dedicated persisted view-count ranking, not a manually curated list."""
+    ranked = _published_articles(order_by_views=True, limit=50)
+    return render_template_string(
+        PUBLIC_TEMPLATE, hero=None, trending=ranked,
+        category_sections=[], south_america=[],
+        view_title="Najčitanije vesti",
+        view_intro="Rangirano prema stvarnom broju pregleda.",
+        is_most_read=True, css=BASE_CSS,
     )
 
 
@@ -1770,10 +2041,13 @@ def rucno_osvezi_vesti_iz_rama():
                     "<p>Jedna vest je uspešno obrađena.</p>"
                 )
             if failed:
+                # The row is durably retained with retry metadata. Return a
+                # normal cron response so the scheduler does not immediately
+                # replay the whole HTTP request on top of the next cycle.
                 return (
                     "<h3>Prevod nije uspeo</h3>"
-                    "<p>Vest ostaje na čekanju i biće ponovo obrađena.</p>"
-                ), 502
+                    "<p>Greška je zabeležena; vest ostaje na čekanju za automatski retry.</p>"
+                )
             return (
                 "<h3>Nema obrađene vesti</h3>"
                 "<p>Proveri Render log.</p>"
@@ -1840,13 +2114,14 @@ def admin():
     db = get_db()
     with _db_lock:
         pending = db.execute(
-            """SELECT id, source, translated_title, priority
+            """SELECT id, source, original_title, translated_title, priority,
+                      last_error, attempt_count
                FROM articles
-               WHERE status='pending' AND translated_title != ''
+               WHERE status='pending'
                ORDER BY priority DESC, published_date DESC, id DESC"""
         ).fetchall()
         published = db.execute(
-            """SELECT id, source, translated_title, priority, views
+            """SELECT id, source, translated_title, priority, category, views
                FROM articles WHERE status='published'
                ORDER BY published_date DESC, id DESC"""
         ).fetchall()
@@ -1880,12 +2155,14 @@ def publish_article(article_id: int):
             db.execute(
                 "UPDATE articles SET position='standard' "
                 "WHERE position='hero' AND id != ?", (article_id,))
+        content_type = "full" if len(summary) >= 280 else "brief"
         db.execute(
             """UPDATE articles
                SET translated_title=?, translated_summary=?,
-                   status='published', position=?
+                   content_type=?, status='published', position=?,
+                   last_error='', next_retry_at=NULL
                WHERE id=?""",
-            (title, summary, position, article_id))
+            (title, summary, content_type, position, article_id))
         db.commit()
     flash(f"Vest #{article_id} je sa&#269;uvana, objavljena i pozicionirana ({position}).")
     return redirect(url_for("admin", article_id=article_id))

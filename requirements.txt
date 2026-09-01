@@ -6,5 +6,5 @@ deep-translator==1.11.4
 # Persistent production database support
 psycopg[binary]>=3.2,<4
 
-# Production WSGI server
+# Production WSGI server (use later as the Render start command)
 gunicorn>=23,<24
