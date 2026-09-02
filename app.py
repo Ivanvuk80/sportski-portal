@@ -33,6 +33,10 @@ Env vars (all optional):
     MAX_TRANSLATIONS_PER_RUN default 1 per cycle
     FEED_TIMEOUT_SECONDS      timeout for each RSS request (default 8)
     MAX_FEEDS_PER_FETCH       RSS feeds per cron call (default 2)
+    HOME_CATEGORY_LIMIT       newest cards per category on homepage (default 12)
+    ARCHIVE_PAGE_SIZE         archive cards per page (default 24)
+    ADMIN_PAGE_SIZE           admin list cards per page (default 40)
+    AUTO_ARCHIVE_DAYS         age for automatic non-destructive archive (30)
     FETCH_INTERVAL_SECONDS    autopilot loop interval (default 600)
     RUN_FETCHER              "0" to disable the background fetcher
     AUTOPILOT_PUBLISH        "1" (default) auto-publishes every translated
@@ -46,6 +50,7 @@ Run:
     python app.py
 """
 
+import calendar
 import html
 import hmac
 import json
@@ -112,21 +117,26 @@ GEMINI_API_URL = (
 )
 # Temporary Render-safe default: one translation per refresh cycle.
 # Increase only after the worker/queue architecture is in place.
-MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", 1))
+MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", "1"))
 # AUTOMATIC publishing: every successfully translated article goes live on its
 # own as a 'standard' card. Placement still follows the priority criteria
 # (Zvezda p=2 -> hero, etc.) and the admin panel ALWAYS stays available so any
 # live article can be edited, repositioned (hero/trending) or deleted by hand.
 # Set AUTOPILOT_PUBLISH=0 to fall back to full manual approval (Na čekanju queue).
 AUTOPILOT_PUBLISH = os.environ.get("AUTOPILOT_PUBLISH", "1") != "0"
-FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", 600))
+FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "600"))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
-FEED_TIMEOUT_SECONDS = int(os.environ.get("FEED_TIMEOUT_SECONDS", 8))
+FEED_TIMEOUT_SECONDS = int(os.environ.get("FEED_TIMEOUT_SECONDS", "8"))
 # Conservative default for a synchronous HTTP cron request: two feeds at a time.
-MAX_FEEDS_PER_FETCH = int(os.environ.get("MAX_FEEDS_PER_FETCH", 2))
+MAX_FEEDS_PER_FETCH = int(os.environ.get("MAX_FEEDS_PER_FETCH", "2"))
+# Homepage stays concise while the full history remains available in /arhiva.
+HOME_CATEGORY_LIMIT = max(1, int(os.environ.get("HOME_CATEGORY_LIMIT", "12")))
+ARCHIVE_PAGE_SIZE = max(1, int(os.environ.get("ARCHIVE_PAGE_SIZE", "24")))
+ADMIN_PAGE_SIZE = max(1, int(os.environ.get("ADMIN_PAGE_SIZE", "40")))
+AUTO_ARCHIVE_DAYS = max(0, int(os.environ.get("AUTO_ARCHIVE_DAYS", "30")))
 # External image search is opt-in only. Google results are not assumed to be
 # licensed for republication; keep the owned inline SVG fallback by default.
 ALLOW_EXTERNAL_IMAGES = os.environ.get("ALLOW_EXTERNAL_IMAGES", "0") == "1"
@@ -353,6 +363,8 @@ CREATE TABLE IF NOT EXISTS articles (
     last_error         TEXT    NOT NULL DEFAULT '',
     last_attempt_at    TEXT,
     next_retry_at      REAL,
+    is_archived        INTEGER NOT NULL DEFAULT 0,
+    archived_at        TEXT,
     views              INTEGER NOT NULL DEFAULT 0
 )
 """
@@ -379,6 +391,8 @@ CREATE TABLE IF NOT EXISTS articles (
     last_error         TEXT    NOT NULL DEFAULT '',
     last_attempt_at    TEXT,
     next_retry_at      REAL,
+    is_archived        INTEGER NOT NULL DEFAULT 0,
+    archived_at        TEXT,
     views              INTEGER NOT NULL DEFAULT 0
 )
 """
@@ -397,6 +411,8 @@ def init_db() -> None:
                 "last_error TEXT NOT NULL DEFAULT ''",
                 "last_attempt_at TEXT",
                 "next_retry_at DOUBLE PRECISION",
+                "is_archived INTEGER NOT NULL DEFAULT 0",
+                "archived_at TEXT",
             ):
                 column_name = column_sql.split()[0]
                 _db.execute(
@@ -414,6 +430,8 @@ def init_db() -> None:
                 "last_error": "TEXT NOT NULL DEFAULT ''",
                 "last_attempt_at": "TEXT",
                 "next_retry_at": "REAL",
+                "is_archived": "INTEGER NOT NULL DEFAULT 0",
+                "archived_at": "TEXT",
             }
             for column_name, column_type in migrations.items():
                 if column_name not in cols:
@@ -1377,6 +1395,19 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .meta{display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:.84rem;
   align-items:center;}
 .views{margin-left:auto; font-weight:600;} .views b{color:var(--green);}
+.archive-tools{display:flex; align-items:end; justify-content:space-between; gap:16px; flex-wrap:wrap;
+  margin:8px 0 22px; padding:14px 16px; background:var(--panel); border:1px solid var(--border);
+  border-radius:12px; color:var(--muted);}
+.archive-tools form{display:flex; align-items:center; gap:10px; margin:0;}
+.archive-tools label{margin:0; color:var(--muted); text-transform:none; letter-spacing:normal;}
+.archive-tools select{background:var(--bg); color:var(--text); border:1px solid var(--border);
+  border-radius:8px; padding:8px 10px; font:inherit;}
+.pagination{display:flex; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap; margin:4px 0 40px;}
+.pagination a,.pagination strong{min-width:36px; padding:8px 12px; text-align:center; border:1px solid var(--border); border-radius:8px;}
+.pagination a:hover{border-color:var(--green); color:var(--green);}
+.pagination strong{background:var(--green); color:#052e16; border-color:var(--green);}
+.admin-list .pagination{margin:12px 0 6px; gap:4px;}
+.admin-list .pagination a,.admin-list .pagination strong{min-width:28px; padding:5px 8px; font-size:.8rem;}
 .empty{background:var(--panel); border:1px dashed var(--border); border-radius:14px;
   color:var(--muted); text-align:center; padding:64px 24px; font-size:1.08rem;}
 .footer-text{color:var(--muted); font-size:.88rem; text-align:center; padding:34px 0 26px;}
@@ -1530,6 +1561,7 @@ PUBLIC_TEMPLATE = """
         </button>
         <div class="nav-dropdown" id="navDropdown">
           <a href="{{ url_for('most_read') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128293;</span> Naj&#269;itanije</a>
+          <a href="{{ url_for('archive') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128218;</span> Arhiva</a>
           <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
           <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
           <a href="{{ url_for('index') }}#tenis" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127934;</span> Tenis</a>
@@ -1581,9 +1613,34 @@ PUBLIC_TEMPLATE = """
 
       {% if trending %}
       <section class="grid-section">
-        {% if not is_most_read %}<div class="section-head"><h3><span class="emoji">&#128293;</span>NAJ&#268;ITANIJE</h3><span class="line"></span></div>{% endif %}
-        <div class="grid">{% for a in trending %}{{ card(a, eager=(loop.index==1), rank=loop.index) }}{% endfor %}</div>
+        {% if not is_most_read %}<div class="section-head"><h3><span class="emoji">{% if is_archive %}&#128218;{% else %}&#128293;{% endif %}</span>{{ list_heading }}</h3><span class="line"></span></div>{% endif %}
+        <div class="grid">{% for a in trending %}{{ card(a, eager=(loop.index==1), rank=(loop.index if is_most_read else none)) }}{% endfor %}</div>
       </section>
+      {% endif %}
+
+      {% if is_archive %}
+      <div class="archive-tools">
+        <form method="get" action="{{ url_for('archive') }}">
+          <label for="archive-category">Filtriraj arhivu</label>
+          <select id="archive-category" name="category" onchange="this.form.submit()">
+            <option value="">Sve kategorije</option>
+            {% for option in archive_categories %}
+            <option value="{{ option.key }}" {{ 'selected' if archive_category == option.key else '' }}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </form>
+        <span>{{ archive_total }} objavljenih vesti</span>
+      </div>
+      {% if archive_total_pages > 1 %}
+      <nav class="pagination" aria-label="Stranice arhive">
+        {% if archive_page > 1 %}<a href="{{ url_for('archive', page=archive_page-1, category=archive_category) }}">&larr; Prethodna</a>{% endif %}
+        {% for number in archive_pages %}
+          {% if number == archive_page %}<strong>{{ number }}</strong>
+          {% else %}<a href="{{ url_for('archive', page=number, category=archive_category) }}">{{ number }}</a>{% endif %}
+        {% endfor %}
+        {% if archive_page < archive_total_pages %}<a href="{{ url_for('archive', page=archive_page+1, category=archive_category) }}">Sledeća &rarr;</a>{% endif %}
+      </nav>
+      {% endif %}
       {% endif %}
 
       {% for section in category_sections %}
@@ -1636,6 +1693,7 @@ ARTICLE_DETAIL_TEMPLATE = """
         </button>
         <div class="nav-dropdown" id="navDropdown">
           <a href="{{ url_for('most_read') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128293;</span> Naj&#269;itanije</a>
+          <a href="{{ url_for('archive') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128218;</span> Arhiva</a>
           <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
           <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
           <a href="{{ url_for('index') }}#tenis" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127934;</span> Tenis</a>
@@ -1772,11 +1830,11 @@ ADMIN_TEMPLATE = """
     <div class="admin-wrap">
       <aside class="admin-list">
         <div class="admin-group">
-          <div class="group-head pending">&#9203; Na &#269;ekanju ({{ pending|length }})</div>
+          <div class="group-head pending">&#9203; Na &#269;ekanju ({{ pending_total }})</div>
           {% if pending %}
             {% for a in pending %}
             <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
-               href="{{ url_for('admin', article_id=a['id']) }}">
+               href="{{ url_for('admin', article_id=a['id'], pending_page=pending_page, published_page=published_page) }}">
               <div class="pi-title">{{ a.translated_title or a.original_title }}{% if a.priority == 2 %} <span class="badge-star">&#11088;</span>{% elif a.priority == 1 %} <span class="badge-hot">&#9889;</span>{% endif %}</div>
               <div class="pi-meta meta">
                 <span>{{ a.source }}</span>
@@ -1787,14 +1845,24 @@ ADMIN_TEMPLATE = """
           {% else %}
             <p class="empty-small">Nema vesti na &#269;ekanju.</p>
           {% endif %}
+          {% if pending_total_pages > 1 %}
+          <nav class="pagination" aria-label="Stranice vesti na čekanju">
+            {% if pending_page > 1 %}<a href="{{ url_for('admin', pending_page=pending_page-1, published_page=published_page) }}">&larr;</a>{% endif %}
+            {% for number in pending_pages %}
+              {% if number == pending_page %}<strong>{{ number }}</strong>
+              {% else %}<a href="{{ url_for('admin', pending_page=number, published_page=published_page) }}">{{ number }}</a>{% endif %}
+            {% endfor %}
+            {% if pending_page < pending_total_pages %}<a href="{{ url_for('admin', pending_page=pending_page+1, published_page=published_page) }}">&rarr;</a>{% endif %}
+          </nav>
+          {% endif %}
         </div>
 
         <div class="admin-group">
-          <div class="group-head published">&#128994; Objavljene vesti &#8211; u&#382;ivo ({{ published|length }})</div>
+          <div class="group-head published">&#128994; Objavljene vesti &#8211; u&#382;ivo ({{ published_total }})</div>
           {% if published %}
             {% for a in published %}
             <a class="pending-item {% if selected and selected['id'] == a['id'] %}active{% endif %}"
-               href="{{ url_for('admin', article_id=a['id']) }}">
+               href="{{ url_for('admin', article_id=a['id'], pending_page=pending_page, published_page=published_page) }}">
               <div class="pi-title">{{ a.translated_title }}</div>
               <div class="pi-meta meta">
                 <span>{{ a.source }}</span>
@@ -1804,6 +1872,16 @@ ADMIN_TEMPLATE = """
             {% endfor %}
           {% else %}
             <p class="empty-small">Jo&#353; uvek nema objavljenih vesti.</p>
+          {% endif %}
+          {% if published_total_pages > 1 %}
+          <nav class="pagination" aria-label="Stranice objavljenih vesti">
+            {% if published_page > 1 %}<a href="{{ url_for('admin', pending_page=pending_page, published_page=published_page-1) }}">&larr;</a>{% endif %}
+            {% for number in published_pages %}
+              {% if number == published_page %}<strong>{{ number }}</strong>
+              {% else %}<a href="{{ url_for('admin', pending_page=pending_page, published_page=number) }}">{{ number }}</a>{% endif %}
+            {% endfor %}
+            {% if published_page < published_total_pages %}<a href="{{ url_for('admin', pending_page=pending_page, published_page=published_page+1) }}">&rarr;</a>{% endif %}
+          </nav>
           {% endif %}
         </div>
       </aside>
@@ -1894,19 +1972,106 @@ ADMIN_TEMPLATE = """
 #  ROUTES
 # =========================================================================== #
 
-def _published_articles(order_by_views: bool = False, limit: int | None = None):
+def _backfill_legacy_categories() -> int:
+    """Persist safe categories for records created before category support."""
+    changed = 0
+    with _db_lock:
+        rows = _db.execute(
+            """SELECT id, source, original_title, original_summary, category
+               FROM articles
+               WHERE category IS NULL OR category IN ('', 'general', 'other')"""
+        ).fetchall()
+        for row in rows:
+            category = classify_category(
+                row["original_title"] or "",
+                row["original_summary"] or "",
+                row["source"] or "",
+            )
+            if category != (row["category"] or ""):
+                _db.execute("UPDATE articles SET category=? WHERE id=?", (category, row["id"]))
+                changed += 1
+        if changed:
+            _db.commit()
+    if changed:
+        print(f"[CATEGORY] backfilled {changed} legacy article categories")
+    return changed
+
+
+def _archive_old_published() -> int:
+    """Move old non-hero/non-manual articles out of the homepage, never delete.
+
+    RSS dates are stored as display text, so only our stable UTC format is
+    eligible. Unknown or provider-specific dates stay visible until a later
+    manual decision rather than being archived accidentally.
+    """
+    if AUTO_ARCHIVE_DAYS <= 0:
+        return 0
+    cutoff = time.time() - AUTO_ARCHIVE_DAYS * 86400
+    archived_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    with _db_lock:
+        rows = _db.execute(
+            """SELECT id, published_date FROM articles
+               WHERE status='published' AND is_archived=0
+                 AND position NOT IN ('hero','trending')"""
+        ).fetchall()
+        ids = []
+        for row in rows:
+            value = (row["published_date"] or "")[:10]
+            try:
+                published_epoch = calendar.timegm(time.strptime(value, "%Y-%m-%d"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if published_epoch < cutoff:
+                ids.append(row["id"])
+        if ids:
+            for article_id in ids:
+                _db.execute(
+                    "UPDATE articles SET is_archived=1, archived_at=? WHERE id=?",
+                    (archived_at, article_id),
+                )
+            _db.commit()
+    if ids:
+        print(f"[ARCHIVE] {len(ids)} old articles moved to archive (no deletion)")
+    return len(ids)
+
+
+def _published_articles(order_by_views: bool = False, limit: int | None = None,
+                         offset: int = 0, include_archived: bool = False,
+                         category: str = ""):
+
     sql = """SELECT id, source, original_title, original_summary, link,
                      translated_title, translated_summary, published_date,
-                     priority, position, category, content_type, views
+                     priority, position, category, content_type, is_archived,
+                     archived_at, views
               FROM articles WHERE status='published'"""
+    if not include_archived:
+        sql += " AND is_archived=0"
+    params = []
+    if category in CATEGORY_LABELS:
+        sql += " AND category=?"
+        params.append(category)
     if order_by_views:
         sql += " ORDER BY views DESC, published_date DESC, id DESC"
     else:
         sql += " ORDER BY published_date DESC, id DESC"
     if limit is not None:
         sql += " LIMIT ?"
+        params.append(limit)
+        if offset:
+            sql += " OFFSET ?"
+            params.append(offset)
     with _db_lock:
-        return _db.execute(sql, (limit,) if limit is not None else ()).fetchall()
+        return _db.execute(sql, tuple(params)).fetchall()
+
+
+def _archive_count(category: str = "") -> int:
+    sql = "SELECT COUNT(*) AS c FROM articles WHERE status='published'"
+    params = []
+    if category in CATEGORY_LABELS:
+        sql += " AND category=?"
+        params.append(category)
+    with _db_lock:
+        return int(_db.execute(sql, tuple(params)).fetchone()["c"] or 0)
 
 
 def _category_sections(articles, excluded_ids: set[int] | None = None) -> list[dict]:
@@ -1917,7 +2082,7 @@ def _category_sections(articles, excluded_ids: set[int] | None = None) -> list[d
             article for article in articles
             if article["id"] not in excluded_ids
             and article_category(article) == config["key"]
-        ]
+        ][:HOME_CATEGORY_LIMIT]
         if section_articles:
             sections.append({**config, "articles": section_articles})
     return sections
@@ -1925,6 +2090,7 @@ def _category_sections(articles, excluded_ids: set[int] | None = None) -> list[d
 
 @app.route("/")
 def index():
+    _archive_old_published()
     articles = _published_articles()
 
     # Hero/featured placement is editorial and independent of view ranking.
@@ -1959,20 +2125,55 @@ def index():
         PUBLIC_TEMPLATE, hero=hero, trending=trending,
         category_sections=category_sections, south_america=south_america,
         view_title="Sportske vesti", view_intro="", is_most_read=False,
-        css=BASE_CSS,
+        is_archive=False, list_heading="NAJČITANIJE", css=BASE_CSS,
     )
 
 
 @app.route("/najcitanije")
 def most_read():
     """Dedicated persisted view-count ranking, not a manually curated list."""
-    ranked = _published_articles(order_by_views=True, limit=50)
+    ranked = _published_articles(
+        order_by_views=True, limit=50, include_archived=True,
+    )
     return render_template_string(
         PUBLIC_TEMPLATE, hero=None, trending=ranked,
         category_sections=[], south_america=[],
         view_title="Najčitanije vesti",
         view_intro="Rangirano prema stvarnom broju pregleda.",
-        is_most_read=True, css=BASE_CSS,
+        is_most_read=True, is_archive=False, list_heading="NAJČITANIJE",
+        css=BASE_CSS,
+    )
+
+
+@app.route("/arhiva")
+def archive():
+    """Paginated catalogue of every published article; nothing is deleted."""
+    _archive_old_published()
+    category = (request.args.get("category") or "").strip().lower()
+    if category not in CATEGORY_LABELS:
+        category = ""
+    total = _archive_count(category)
+    total_pages = max(1, (total + ARCHIVE_PAGE_SIZE - 1) // ARCHIVE_PAGE_SIZE)
+    page = max(1, request.args.get("page", 1, type=int) or 1)
+    page = min(page, total_pages)
+    rows = _published_articles(
+        limit=ARCHIVE_PAGE_SIZE,
+        offset=(page - 1) * ARCHIVE_PAGE_SIZE,
+        include_archived=True,
+        category=category,
+    )
+    page_start = max(1, page - 2)
+    page_end = min(total_pages, page + 2)
+    return render_template_string(
+        PUBLIC_TEMPLATE, hero=None, trending=rows,
+        category_sections=[], south_america=[],
+        view_title="Arhiva vesti",
+        view_intro="Sve objavljene vesti ostaju sačuvane; prikaz je podeljen po stranicama.",
+        is_most_read=False, is_archive=True,
+        list_heading="ARHIVA VESTI", archive_category=category,
+        archive_categories=CATEGORY_CONFIG, archive_page=page,
+        archive_total=total, archive_total_pages=total_pages,
+        archive_pages=range(page_start, page_end + 1), css=BASE_CSS,
     )
 
 
@@ -2113,24 +2314,52 @@ def admin_logout():
 def admin():
     db = get_db()
     with _db_lock:
+        pending_total = int(db.execute(
+            "SELECT COUNT(*) AS c FROM articles WHERE status='pending'"
+        ).fetchone()["c"] or 0)
+        published_total = int(db.execute(
+            "SELECT COUNT(*) AS c FROM articles WHERE status='published'"
+        ).fetchone()["c"] or 0)
+
+        pending_pages_total = max(1, (pending_total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+        published_pages_total = max(1, (published_total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+        pending_page = max(1, request.args.get("pending_page", 1, type=int) or 1)
+        published_page = max(1, request.args.get("published_page", 1, type=int) or 1)
+        pending_page = min(pending_page, pending_pages_total)
+        published_page = min(published_page, published_pages_total)
+
         pending = db.execute(
             """SELECT id, source, original_title, translated_title, priority,
                       last_error, attempt_count
                FROM articles
                WHERE status='pending'
-               ORDER BY priority DESC, published_date DESC, id DESC"""
+               ORDER BY priority DESC, published_date DESC, id DESC
+               LIMIT ? OFFSET ?""",
+            (ADMIN_PAGE_SIZE, (pending_page - 1) * ADMIN_PAGE_SIZE),
         ).fetchall()
         published = db.execute(
-            """SELECT id, source, translated_title, priority, category, views
+            """SELECT id, source, translated_title, priority, category, views,
+                      is_archived
                FROM articles WHERE status='published'
-               ORDER BY published_date DESC, id DESC"""
+               ORDER BY published_date DESC, id DESC
+               LIMIT ? OFFSET ?""",
+            (ADMIN_PAGE_SIZE, (published_page - 1) * ADMIN_PAGE_SIZE),
         ).fetchall()
         selected = None
         article_id = request.args.get("article_id", type=int)
         if article_id:
             selected = db.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
+
+    def page_window(current: int, total: int):
+        return range(max(1, current - 2), min(total, current + 2) + 1)
+
     return render_template_string(
         ADMIN_TEMPLATE, pending=pending, published=published,
+        pending_total=pending_total, published_total=published_total,
+        pending_page=pending_page, pending_total_pages=pending_pages_total,
+        pending_pages=page_window(pending_page, pending_pages_total),
+        published_page=published_page, published_total_pages=published_pages_total,
+        published_pages=page_window(published_page, published_pages_total),
         selected=selected, css=BASE_CSS,
     )
 
@@ -2186,6 +2415,7 @@ def delete_article(article_id: int):
 # =========================================================================== #
 
 init_db()
+_backfill_legacy_categories()
 print(f"[DB] connected using {DB_DIALECT}")
 start_background_fetcher()
 
