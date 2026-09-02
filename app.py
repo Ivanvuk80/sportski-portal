@@ -33,6 +33,7 @@ Env vars (all optional):
     MAX_TRANSLATIONS_PER_RUN default 1 per cycle
     FEED_TIMEOUT_SECONDS      timeout for each RSS request (default 8)
     MAX_FEEDS_PER_FETCH       RSS feeds per cron call (default 2)
+    MAX_ENTRIES_PER_FEED      newest entries accepted from each feed (3)
     HOME_CATEGORY_LIMIT       newest cards per category on homepage (default 12)
     ARCHIVE_PAGE_SIZE         archive cards per page (default 24)
     ADMIN_PAGE_SIZE           admin list cards per page (default 40)
@@ -132,6 +133,8 @@ ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
 FEED_TIMEOUT_SECONDS = int(os.environ.get("FEED_TIMEOUT_SECONDS", "8"))
 # Conservative default for a synchronous HTTP cron request: two feeds at a time.
 MAX_FEEDS_PER_FETCH = int(os.environ.get("MAX_FEEDS_PER_FETCH", "2"))
+# Prevent one high-volume feed from filling the entire translation queue.
+MAX_ENTRIES_PER_FEED = max(1, int(os.environ.get("MAX_ENTRIES_PER_FEED", "3")))
 # Homepage stays concise while the full history remains available in /arhiva.
 HOME_CATEGORY_LIMIT = max(1, int(os.environ.get("HOME_CATEGORY_LIMIT", "12")))
 ARCHIVE_PAGE_SIZE = max(1, int(os.environ.get("ARCHIVE_PAGE_SIZE", "24")))
@@ -154,8 +157,8 @@ BROWSER_UA = (
 # licence. Keep the stored material as a factual, attributed news brief.
 SPORTS_FEEDS = [
     # DOMAĆI TEREN - profesionalne domaće redakcije (već na srpskom)
-    {"name": "Sportski žurnal", "url": "http://www.zurnal.rs/rss", "lang": "sr", "category": "football"},
-    {"name": "Telegraf Sport", "url": "https://www.telegraf.rs/rss/sport", "lang": "sr", "category": "football"},
+    {"name": "Sportski žurnal", "url": "http://www.zurnal.rs/rss", "lang": "sr"},
+    {"name": "Telegraf Sport", "url": "https://www.telegraf.rs/rss/sport", "lang": "sr"},
     # EVROPSKI GIGANTI (La Liga, Serija A, Premijer liga, Liga šampiona, transferi)
     {"name": "Marca (Španija)", "url": "https://e00-marca.uecdn.es/rss/futbol.xml", "lang": "es", "category": "football"},
     {"name": "AS (Španija)", "url": "https://as.com/rss/futbol/portada.xml", "lang": "es", "category": "football"},
@@ -769,14 +772,19 @@ def fetch_all_feeds(feeds: list[dict] | None = None) -> tuple[int, int]:
                 raise parsed.bozo_exception or RuntimeError("Feed vratio 0 vesti")
 
             batch = []          # build rows WITHOUT holding the lock across the network
-            for entry in parsed.entries:
+            entries = parsed.entries[:MAX_ENTRIES_PER_FEED]
+            print(
+                f"[FETCH] {source}: considering {len(entries)} newest of "
+                f"{len(parsed.entries)} feed entries"
+            )
+            for entry in entries:
                 art = parse_entry(entry, source)
                 if not art["link"]:
                     continue
                 # Unsupported sports are intentionally retained and routed
                 # to the extensible "Ostalo" category instead of being lost.
                 art["priority"] = calculate_priority(art["title"], art["summary"])
-                feed_category = feed.get("category")
+                feed_category = feed.get("category") or _SOURCE_CATEGORY_HINTS.get(source)
                 art["category"] = (
                     feed_category if feed_category in CATEGORY_LABELS
                     else classify_category(art["title"], art["summary"], source)
@@ -1038,6 +1046,22 @@ CATEGORY_CONFIG = [
 ]
 CATEGORY_LABELS = {item["key"]: item["label"] for item in CATEGORY_CONFIG}
 CATEGORY_EMOJIS = {item["key"]: item["emoji"] for item in CATEGORY_CONFIG}
+
+# Only dedicated feeds receive a source hint. Mixed domestic feeds are
+# classified per article; otherwise their basketball/tennis/boxing items would
+# all inherit a football label merely because the feed is called "Sport".
+_SOURCE_CATEGORY_HINTS = {
+    "Marca (Španija)": "football",
+    "AS (Španija)": "football",
+    "Gazzetta (Italija)": "football",
+    "Sky Sports (Engleska)": "football",
+    "Football Italia": "football",
+    "Eurohoops": "basketball",
+    "Sportando": "basketball",
+    "ESPN Tennis": "tennis",
+    "ATP Tour": "tennis",
+    "BoxingScene": "boxing",
+}
 
 # Keep category signals specific. Generic words such as "meč", "trener",
 # "napad" and "odbrana" are intentionally absent because they misclassify
@@ -1972,20 +1996,20 @@ ADMIN_TEMPLATE = """
 #  ROUTES
 # =========================================================================== #
 
-def _backfill_legacy_categories() -> int:
-    """Persist safe categories for records created before category support."""
+def _backfill_categories() -> int:
+    """Recompute persisted categories, fixing records from old broad rules."""
     changed = 0
     with _db_lock:
         rows = _db.execute(
             """SELECT id, source, original_title, original_summary, category
-               FROM articles
-               WHERE category IS NULL OR category IN ('', 'general', 'other')"""
+               FROM articles"""
         ).fetchall()
         for row in rows:
-            category = classify_category(
+            source = row["source"] or ""
+            category = _SOURCE_CATEGORY_HINTS.get(source) or classify_category(
                 row["original_title"] or "",
                 row["original_summary"] or "",
-                row["source"] or "",
+                source,
             )
             if category != (row["category"] or ""):
                 _db.execute("UPDATE articles SET category=? WHERE id=?", (category, row["id"]))
@@ -1993,7 +2017,7 @@ def _backfill_legacy_categories() -> int:
         if changed:
             _db.commit()
     if changed:
-        print(f"[CATEGORY] backfilled {changed} legacy article categories")
+        print(f"[CATEGORY] corrected {changed} article categories")
     return changed
 
 
@@ -2113,7 +2137,7 @@ def index():
     south_america = [
         a for a in articles
         if a["id"] not in featured_ids and is_south_america(a)
-    ]
+    ][:HOME_CATEGORY_LIMIT]
     south_ids = {a["id"] for a in south_america}
     category_sections = [
         {**section, "articles": [a for a in section["articles"] if a["id"] not in south_ids]}
@@ -2415,7 +2439,7 @@ def delete_article(article_id: int):
 # =========================================================================== #
 
 init_db()
-_backfill_legacy_categories()
+_backfill_categories()
 print(f"[DB] connected using {DB_DIALECT}")
 start_background_fetcher()
 
