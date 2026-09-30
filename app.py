@@ -1,3 +1,4 @@
+# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only
 """
 Sports News Aggregator - Single-file, self-updating build.
 
@@ -126,6 +127,11 @@ MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", "1"))
 # Set AUTOPILOT_PUBLISH=0 to fall back to full manual approval (Na čekanju queue).
 AUTOPILOT_PUBLISH = os.environ.get("AUTOPILOT_PUBLISH", "1") != "0"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "600"))
+
+# Editorial freshness windows: Hero and "Najcitanije" slots are released
+# after this age so an old pinned story can never block the homepage.
+HERO_MAX_AGE_HOURS = float(os.environ.get("HERO_MAX_AGE_HOURS", "24"))
+TRENDING_MAX_AGE_HOURS = float(os.environ.get("TRENDING_MAX_AGE_HOURS", "24"))
 RUN_FETCHER = os.environ.get("RUN_FETCHER", "1") != "0"
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -210,23 +216,69 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-in-production")
 
 class _DatabaseAdapter:
-    """Small compatibility layer for existing qmark SQL in SQLite/PostgreSQL."""
+    """Small compatibility layer for existing qmark SQL in SQLite/PostgreSQL.
 
-    def __init__(self, connection, dialect: str):
+    Self-healing for free-tier hosting: Neon/Render routinely drop idle
+    sockets or interrupt queries. The old code kept one shared connection
+    forever, so one interruption (or an aborted transaction never rolled
+    back) turned EVERY page into HTTP 500 until a manual restart.
+    Now a failed statement rolls the broken transaction back, reconnects
+    when the socket itself is dead, and is retried exactly once.
+    """
+
+    _PG_OPTIONS = ("-c lock_timeout=5000 "
+                   "-c idle_in_transaction_session_timeout=300000")
+
+    def __init__(self, connection, dialect: str, dsn: str = ""):
         self.connection = connection
         self.dialect = dialect
+        self.dsn = dsn
+
+    def _reconnect(self):
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+        self.connection = psycopg.connect(
+            self.dsn,
+            row_factory=dict_row,
+            connect_timeout=10,
+            options=self._PG_OPTIONS,
+        )
 
     def execute(self, sql: str, params=()):
-        if self.dialect == "postgres":
-            # All application queries use ? placeholders. psycopg uses %s.
-            sql = sql.replace("?", "%s")
-        return self.connection.execute(sql, params)
+        if self.dialect != "postgres":
+            return self.connection.execute(sql, params)
+        # All application queries use ? placeholders. psycopg uses %s.
+        sql = sql.replace("?", "%s")
+        try:
+            return self.connection.execute(sql, params)
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            self._reconnect()
+            return self.connection.execute(sql, params)
+        except psycopg.Error:
+            # Aborted-transaction state (25P02) or any leftover SQL error:
+            # roll back so one bad statement can never poison every later
+            # request on the shared connection, then retry once.
+            try:
+                self.connection.rollback()
+            except Exception:
+                self._reconnect()
+            return self.connection.execute(sql, params)
 
     def commit(self):
-        return self.connection.commit()
+        try:
+            return self.connection.commit()
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            if self.dialect == "postgres":
+                self._reconnect()
+            raise
 
     def rollback(self):
-        return self.connection.rollback()
+        try:
+            return self.connection.rollback()
+        except Exception:
+            pass
 
 
 # One shared connection + a lock for multi-thread (Flask + fetcher) access.
@@ -244,12 +296,13 @@ if DATABASE_URL:
         DATABASE_URL,
         row_factory=dict_row,
         connect_timeout=10,
+        options=_DatabaseAdapter._PG_OPTIONS,
     )
 else:
     _raw_db = sqlite3.connect(DB_PATH, check_same_thread=False)
     _raw_db.row_factory = sqlite3.Row
 
-_db = _DatabaseAdapter(_raw_db, DB_DIALECT)
+_db = _DatabaseAdapter(_raw_db, DB_DIALECT, (DATABASE_URL if DB_DIALECT == "postgres" else ""))
 
 # Prevent the background fetcher and the HTTP refresh route from running
 # overlapping RSS/Gemini cycles and spending duplicate API calls.
@@ -404,23 +457,33 @@ CREATE TABLE IF NOT EXISTS articles (
 def init_db() -> None:
     with _db_lock:
         if DB_DIALECT == "postgres":
-            _db.execute(SCHEMA_SQL_POSTGRES)
-            # PostgreSQL migrations for databases created by older versions.
-            for column_sql in (
-                "position TEXT NOT NULL DEFAULT 'standard'",
-                "category TEXT NOT NULL DEFAULT 'other'",
-                "content_type TEXT NOT NULL DEFAULT 'brief'",
-                "attempt_count INTEGER NOT NULL DEFAULT 0",
-                "last_error TEXT NOT NULL DEFAULT ''",
-                "last_attempt_at TEXT",
-                "next_retry_at DOUBLE PRECISION",
-                "is_archived INTEGER NOT NULL DEFAULT 0",
-                "archived_at TEXT",
-            ):
-                column_name = column_sql.split()[0]
-                _db.execute(
-                    f"ALTER TABLE articles ADD COLUMN IF NOT EXISTS {column_name} {column_sql[len(column_name)+1:]}"
-                )
+            # DDL can block behind locks left by crashed old instances;
+            # never let it hang or kill the boot (the table already exists).
+            try:
+                _db.execute(SCHEMA_SQL_POSTGRES)
+            except Exception as exc:
+                print(f"[DB] schema create skipped: {exc}")
+                _db.rollback()
+            try:
+                # PostgreSQL migrations for databases created by older versions.
+                for column_sql in (
+                    "position TEXT NOT NULL DEFAULT 'standard'",
+                    "category TEXT NOT NULL DEFAULT 'other'",
+                    "content_type TEXT NOT NULL DEFAULT 'brief'",
+                    "attempt_count INTEGER NOT NULL DEFAULT 0",
+                    "last_error TEXT NOT NULL DEFAULT ''",
+                    "last_attempt_at TEXT",
+                    "next_retry_at DOUBLE PRECISION",
+                    "is_archived INTEGER NOT NULL DEFAULT 0",
+                    "archived_at TEXT",
+                ):
+                    column_name = column_sql.split()[0]
+                    _db.execute(
+                        f"ALTER TABLE articles ADD COLUMN IF NOT EXISTS {column_name} {column_sql[len(column_name)+1:]}"
+                    )
+            except Exception as exc:
+                print(f"[DB] column migration skipped: {exc}")
+                _db.rollback()
         else:
             _db.execute(SCHEMA_SQL_SQLITE)
             # SQLite migration for any pre-existing table without new metadata.
@@ -1263,8 +1326,14 @@ def article_category(article) -> str:
 
 
 def is_south_america(article) -> bool:
-    text = article_text_blob(article)
-    return any(re.search(rf"\b{re.escape(k)}", text) for k in _SOUTH_AMERICA_KEYWORDS)
+    """South-America bucket is decided by TITLES only. Scanning full summaries
+    misfiled any story whose body quoted a legend ("Pele/Maradona") into Južna
+    Amerika (e.g. a Cristiano Ronaldo piece)."""
+    try:
+        title = f"{article['translated_title'] or ''} {article['original_title'] or ''}".lower()
+    except (KeyError, IndexError, TypeError):
+        return False
+    return any(re.search(rf"\b{re.escape(k)}", title) for k in _SOUTH_AMERICA_KEYWORDS)
 
 
 def category_label(article) -> str:
@@ -2088,6 +2157,24 @@ def _published_articles(order_by_views: bool = False, limit: int | None = None,
         return _db.execute(sql, tuple(params)).fetchall()
 
 
+def _article_age_hours(article) -> float | None:
+    """Article age in hours; None when the date is unparsable.
+    Unknown dates are treated as fresh so nothing is ever hidden by accident."""
+    value = (article.get("published_date") or "").strip()
+    for fmt, cut in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+        try:
+            epoch = calendar.timegm(time.strptime(value[:cut], fmt))
+            return max(0.0, (time.time() - epoch) / 3600.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
+def _article_is_fresh(article, max_hours: float) -> bool:
+    age = _article_age_hours(article)
+    return age is None or age <= max_hours
+
+
 def _archive_count(category: str = "") -> int:
     sql = "SELECT COUNT(*) AS c FROM articles WHERE status='published'"
     params = []
@@ -2117,21 +2204,50 @@ def index():
     _archive_old_published()
     articles = _published_articles()
 
-    # Hero/featured placement is editorial and independent of view ranking.
-    hero = next((a for a in articles if a["position"] == "hero"), None)
+    # Hero is editorial but time-boxed: a 'hero' pin expires after
+    # HERO_MAX_AGE_HOURS hours, so yesterday's derby cannot block today's news.
+    # Expired pins are demoted to 'standard' in the DB (keeps admin truthful).
+    hero = next(
+        (a for a in articles
+         if a["position"] == "hero" and _article_is_fresh(a, HERO_MAX_AGE_HOURS)),
+        None)
+    stale_hero_ids = [
+        a["id"] for a in articles
+        if a["position"] == "hero" and not _article_is_fresh(a, HERO_MAX_AGE_HOURS)]
+    if stale_hero_ids:
+        placeholders = ",".join("?" * len(stale_hero_ids))
+        with _db_lock:
+            _db.execute(
+                f"UPDATE articles SET position='standard' WHERE id IN ({placeholders})",
+                tuple(stale_hero_ids))
+            _db.commit()
     if hero is None:
+        # Winner order: fresh Star (Zvezda) story -> any high-priority story ->
+        # the freshest article overall, so the slot is never empty.
         hero = next((a for a in articles if a["priority"] == 2), None) or \
-            next((a for a in articles if a["priority"] == 1), None)
+            next((a for a in articles if a["priority"] == 1), None) or \
+            (articles[0] if articles else None)
     hero_id = hero["id"] if hero else None
 
-    # Najčitanije is always a view-based ranking. Legacy position='trending'
-    # values are not consulted here; they remain only a manual placement hint.
+    # "Najcitanije" = most viewed among RECENT stories only
+    # (TRENDING_MAX_AGE_HOURS, default 24h). Older giants can no longer squat
+    # the slot forever; if fewer than 3 fresh stories exist, the newest ones
+    # pad the row so the homepage never looks empty.
     ranked = sorted(
-        (a for a in articles if a["id"] != hero_id),
+        (a for a in articles
+         if a["id"] != hero_id and _article_is_fresh(a, TRENDING_MAX_AGE_HOURS)),
         key=lambda a: (a["views"] or 0, a["published_date"] or "", a["id"]),
         reverse=True,
     )
     trending = ranked[:3]
+    if len(trending) < 3:
+        have = {a["id"] for a in trending} | ({hero_id} if hero_id is not None else set())
+        fill = sorted(
+            (a for a in articles if a["id"] not in have),
+            key=lambda a: (a["published_date"] or "", a["id"]),
+            reverse=True,
+        )
+        trending = (trending + fill)[:3]
     featured_ids = ({hero_id} if hero_id is not None else set()) | {a["id"] for a in trending}
     category_sections = _category_sections(articles, featured_ids)
     south_america = [
