@@ -1,4 +1,4 @@
-# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only
+# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y)
 """
 Sports News Aggregator - Single-file, self-updating build.
 
@@ -214,6 +214,34 @@ TRANSLATION_ERROR_MARKERS = (
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-in-production")
+
+# --- Security headers (v2026-09-30 P1+). Svi dobijaju iste vrednosti;
+# CSP je baseline: inline stilovi/handleri ostaju dozvoljeni (sajt ih
+# koristi), bez eksternih biblioteka, slike smeju s bilo kog HTTPS izvora.
+_CSP = (
+    "default-src 'self'; "
+    "img-src 'self' data: https:; "
+    "style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'self'"
+)
+
+
+@app.after_request
+def _security_headers(resp):
+    h = resp.headers
+    h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    h.setdefault("Content-Security-Policy", _CSP)
+    h.setdefault("X-Frame-Options", "SAMEORIGIN")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return resp
 
 class _DatabaseAdapter:
     """Small compatibility layer for existing qmark SQL in SQLite/PostgreSQL.
@@ -1440,7 +1468,7 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
              rgba(2,6,23,.15) 75%, rgba(2,6,23,.05) 100%);}
 .hero-content{position:relative; padding:34px 36px; max-width:860px;}
 .hero-tags{display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap;}
-.hero h2{font-size:clamp(1.6rem,3.6vw,2.6rem); font-weight:800; line-height:1.15;
+.hero h1, .hero h2{font-size:clamp(1.6rem,3.6vw,2.6rem); font-weight:800; line-height:1.15;
   margin-bottom:12px; text-shadow:0 2px 14px rgba(0,0,0,.5);}
 .hero p{font-size:clamp(1rem,1.6vw,1.18rem); color:#cbd5e1; margin-bottom:16px;}
 
@@ -1607,14 +1635,20 @@ PUBLIC_TEMPLATE = """
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ view_title }} &#8211; Sportski Portal</title>
+  <meta name="description" content="Sportski Portal — najnovije sportske vesti iz Srbije i sveta: fudbal, ko&#353;arka, tenis, boks. Udarne vesti, rezultati, transferi i analize.">
+  <meta property="og:title" content="{% if view_title %}{{ view_title }} &#8211; {% endif %}Sportski Portal">
+  <meta property="og:description" content="Najnovije sportske vesti iz Srbije i sveta: fudbal, ko&#353;arka, tenis, boks. Udarne vesti, rezultati i analize.">
+  <meta property="og:type" content="website">
+  {% if hero %}{% set _img = article_image(hero) %}{% if _img.startswith('https') %}<meta property="og:image" content="{{ _img|e }}">{% endif %}{% endif %}
   <style>{{ css|safe }}</style>
 </head>
 <body>
+  <a href="#main" class="skip-link" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;" onfocus="this.style.left='0';this.style.width='auto';this.style.height='auto';this.style.zIndex='9999';this.style.background='#0f172a';this.style.color='#fff';this.style.padding='10px 16px';this.style.overflow='visible'" onblur="this.style.left='-9999px';this.style.width='1px';this.style.height='1px';this.style.overflow='hidden'">Presko&#269;i na sadr&#382;aj</a>
   {% macro card(a, eager=false, rank=none) -%}
   <a class="card {% if rank %}trending{% endif %}"
      href="{{ url_for('article_detail', article_id=a['id']) }}">
     <div class="card-media">
-      <img src="{{ article_image(a) }}" alt="{{ a.translated_title }}"
+      <img src="{{ article_image(a) }}" alt="{{ a.translated_title|truncate(95) }}"
            loading="{{ 'eager' if eager else 'lazy' }}" onerror="this.style.opacity='0'">
       <span class="chip">{{ category_label(a) }}</span>
       {% if a.content_type != 'full' %}<span class="chip">Kratka vest</span>{% endif %}
@@ -1667,7 +1701,7 @@ PUBLIC_TEMPLATE = """
     </div>
   </header>
 
-  <main class="container">
+  <main class="container" id="main">
     {% if hero or trending or category_sections or south_america %}
 
       {% if hero %}
@@ -1675,7 +1709,7 @@ PUBLIC_TEMPLATE = """
         <h3><span class="emoji">&#9889;</span>UDARNA VEST</h3><span class="line"></span>
       </div>
       <a class="hero" href="{{ url_for('article_detail', article_id=hero['id']) }}">
-        <img src="{{ article_image(hero) }}" alt="{{ hero.translated_title }}"
+        <img src="{{ article_image(hero) }}" alt="{{ hero.translated_title|truncate(95) }}"
              loading="eager" onerror="this.style.display='none'">
         <div class="hero-overlay"></div>
         <div class="hero-content">
@@ -1687,7 +1721,7 @@ PUBLIC_TEMPLATE = """
             {% for club in club_badges(hero) %}<span class="club-chip {{ club.css }}">&#9917; {{ club.label }}</span>{% endfor %}
             <span class="chip">&#128065; {{ hero.views or 0 }}</span>
           </div>
-          <h2>{{ hero.translated_title }}</h2>
+          {% if is_most_read %}<h2>{{ hero.translated_title }}</h2>{% else %}<h1>{{ hero.translated_title }}</h1>{% endif %}
           <p>{{ hero.translated_summary }}</p>
           <div class="meta">
             <span>&#128337; {{ hero.published_date }}</span>
@@ -1770,6 +1804,11 @@ ARTICLE_DETAIL_TEMPLATE = """
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ a.translated_title }} &#8211; Sportski Portal</title>
+  <meta name="description" content="{{ (a.translated_summary or a.translated_title)|truncate(160)|e }}">
+  <meta property="og:title" content="{{ a.translated_title|e }}">
+  <meta property="og:description" content="{{ (a.translated_summary or '')|truncate(200)|e }}">
+  <meta property="og:type" content="article">
+  {% set _img = article_image(a) %}{% if _img.startswith('https') %}<meta property="og:image" content="{{ _img|e }}">{% endif %}
   <style>{{ css|safe }}</style>
 </head>
 <body>
@@ -1803,7 +1842,7 @@ ARTICLE_DETAIL_TEMPLATE = """
     <a class="back-link" href="{{ url_for('index') }}">&larr; Nazad na po&#269;etnu</a>
 
     <article class="article-card">
-      <img class="article-cover" src="{{ article_image(a) }}" alt="{{ a.translated_title }}"
+      <img class="article-cover" src="{{ article_image(a) }}" alt="{{ a.translated_title|truncate(95) }}"
            onerror="this.style.display='none'">
       <div class="article-inner">
         <div class="article-tags">
