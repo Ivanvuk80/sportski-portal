@@ -1,4 +1,4 @@
-# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y)
+# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y) + P1.1(headings) + P1.2(gemini-3.5-model)
 """
 Sports News Aggregator - Single-file, self-updating build.
 
@@ -109,10 +109,10 @@ ADMIN_LOGIN_PATH = ADMIN_PATH + "/login"
 ADMIN_LOGOUT_PATH = ADMIN_PATH + "/logout"
 REFRESH_PATH = "/osvezi-vesti-777"          # cron refresh trigger
 
-TRANSLATION_MODE = os.environ.get("TRANSLATION_MODE", "ai")    # "ai" | "free"
+TRANSLATION_MODE = (os.environ.get("TRANSLATION_MODE") or "ai").strip() or "ai"    # "ai" | "free"
 TARGET_LANGUAGE = "sr"
 # Google AI Studio (Gemini) free tier. No external SDK needed - plain HTTPS call.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "").strip() or "gemini-3.5-flash-lite"  # prazno = default; 2.5-flash povucen -> 404
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "{model}:generateContent?key={key}"
@@ -778,8 +778,6 @@ def _translate_ai(text: str, is_headline: bool, source_headline: str | None) -> 
         "generationConfig": {
             "temperature": 0.7,
             "maxOutputTokens": tokens,
-            # gemini-2.5-flash: disable internal "thinking" for fast, cheap output
-            "thinkingConfig": {"thinkingBudget": 0},
         },
         # Don't let sports content (hard tackles, derbies) trip the safety filter.
         "safetySettings": [
@@ -1473,10 +1471,10 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .hero p{font-size:clamp(1rem,1.6vw,1.18rem); color:#cbd5e1; margin-bottom:16px;}
 
 .section-head{display:flex; align-items:center; gap:12px; margin:8px 0 20px;}
-.section-head h3{font-size:1.25rem; font-weight:800; letter-spacing:.4px;
+.section-head h2{font-size:1.25rem; font-weight:800; letter-spacing:.4px;
   border-left:4px solid var(--green); padding-left:12px;}
 .section-head .line{flex:1; height:1px; background:var(--border);}
-.section-head h3 .emoji{margin-right:8px;}
+.section-head h2 .emoji{margin-right:8px;}
 .sa-sub{font-size:.72rem; font-weight:600; color:var(--muted);
   text-transform:none; letter-spacing:.3px; white-space:nowrap;}
 .grid-section{margin-bottom:44px; scroll-margin-top:88px;}
@@ -1495,7 +1493,7 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .card:hover .card-media img{transform:scale(1.06);}
 .card-media .chip{position:absolute; top:12px; left:12px;}
 .card-body{padding:18px 20px 20px; display:flex; flex-direction:column; gap:10px; flex:1;}
-.card-body h4{font-size:1.06rem; font-weight:700; line-height:1.35;}
+.card-body h3, .card-body h2{font-size:1.06rem; font-weight:700; line-height:1.35;}
 .card-excerpt{color:#cbd5e1; font-size:.92rem; display:-webkit-box;
   -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;}
 .card-body .meta{margin-top:auto; padding-top:8px; border-top:1px solid var(--border);}
@@ -1510,7 +1508,7 @@ a{color:inherit; text-decoration:none;} img{display:block; max-width:100%;}
 .card-rank{position:absolute; bottom:12px; left:12px; width:30px; height:30px;
   border-radius:50%; background:var(--green); color:#052e16; font-weight:800;
   display:flex; align-items:center; justify-content:center; box-shadow:0 4px 12px rgba(2,6,23,.5);}
-.hero-head h3{font-size:1.25rem; font-weight:800; border-left:4px solid var(--green);
+.hero-head h2{font-size:1.25rem; font-weight:800; border-left:4px solid var(--green);
   padding-left:12px;} .hero-head{margin:8px 0 18px;}
 
 .meta{display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:.84rem;
@@ -1644,7 +1642,7 @@ PUBLIC_TEMPLATE = """
 </head>
 <body>
   <a href="#main" class="skip-link" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;" onfocus="this.style.left='0';this.style.width='auto';this.style.height='auto';this.style.zIndex='9999';this.style.background='#0f172a';this.style.color='#fff';this.style.padding='10px 16px';this.style.overflow='visible'" onblur="this.style.left='-9999px';this.style.width='1px';this.style.height='1px';this.style.overflow='hidden'">Presko&#269;i na sadr&#382;aj</a>
-  {% macro card(a, eager=false, rank=none) -%}
+  {% macro card(a, eager=false, rank=none, h='h3') -%}
   <a class="card {% if rank %}trending{% endif %}"
      href="{{ url_for('article_detail', article_id=a['id']) }}">
     <div class="card-media">
@@ -1659,7 +1657,7 @@ PUBLIC_TEMPLATE = """
       {% if rank %}<span class="card-rank">{{ rank }}</span>{% endif %}
     </div>
     <div class="card-body">
-      <h4>{{ a.translated_title }}</h4>
+      {% if h == "h2" %}<h2>{{ a.translated_title }}</h2>{% else %}<h3>{{ a.translated_title }}</h3>{% endif %}
       {% set clubs = club_badges(a) %}
       {% if clubs %}
       <div class="club-badges">
@@ -1706,7 +1704,7 @@ PUBLIC_TEMPLATE = """
 
       {% if hero %}
       <div class="hero-head section-head">
-        <h3><span class="emoji">&#9889;</span>UDARNA VEST</h3><span class="line"></span>
+        <h2><span class="emoji">&#9889;</span>UDARNA VEST</h2><span class="line"></span>
       </div>
       <a class="hero" href="{{ url_for('article_detail', article_id=hero['id']) }}">
         <img src="{{ article_image(hero) }}" alt="{{ hero.translated_title|truncate(95) }}"
@@ -1731,7 +1729,7 @@ PUBLIC_TEMPLATE = """
       </a>
       {% endif %}
 
-      {% if is_most_read %}
+      {% if is_most_read or is_archive %}
       <div class="hero-head section-head" style="margin-top:26px;">
         <h1 style="font-size:1.65rem;">{{ view_title }}</h1><span class="line"></span>
       </div>
@@ -1740,8 +1738,8 @@ PUBLIC_TEMPLATE = """
 
       {% if trending %}
       <section class="grid-section">
-        {% if not is_most_read %}<div class="section-head"><h3><span class="emoji">{% if is_archive %}&#128218;{% else %}&#128293;{% endif %}</span>{{ list_heading }}</h3><span class="line"></span></div>{% endif %}
-        <div class="grid">{% for a in trending %}{{ card(a, eager=(loop.index==1), rank=(loop.index if is_most_read else none)) }}{% endfor %}</div>
+        {% if not is_most_read %}<div class="section-head"><h2><span class="emoji">{% if is_archive %}&#128218;{% else %}&#128293;{% endif %}</span>{{ list_heading }}</h2><span class="line"></span></div>{% endif %}
+        <div class="grid">{% for a in trending %}{{ card(a, eager=(loop.index==1), rank=(loop.index if is_most_read else none), h=('h2' if is_most_read else 'h3')) }}{% endfor %}</div>
       </section>
       {% endif %}
 
@@ -1772,14 +1770,14 @@ PUBLIC_TEMPLATE = """
 
       {% for section in category_sections %}
       <section class="grid-section" id="{{ section.anchor }}">
-        <div class="section-head"><h3><span class="emoji">{{ section.emoji }}</span>{{ section.label }}</h3><span class="line"></span></div>
+        <div class="section-head"><h2><span class="emoji">{{ section.emoji }}</span>{{ section.label }}</h2><span class="line"></span></div>
         <div class="grid">{% for a in section.articles %}{{ card(a) }}{% endfor %}</div>
       </section>
       {% endfor %}
 
       {% if south_america %}
       <section class="grid-section" id="juzna-amerika">
-        <div class="section-head"><h3><span class="emoji">&#10024;</span>JU&#381;NOAMERI&#268;KA MAGIJA <span class="sa-sub">(Gau&#269;osi i Karijoke)</span></h3><span class="line"></span></div>
+        <div class="section-head"><h2><span class="emoji">&#10024;</span>JU&#381;NOAMERI&#268;KA MAGIJA <span class="sa-sub"> (Gau&#269;osi i Karijoke)</span></h2><span class="line"></span></div>
         <div class="grid">{% for a in south_america %}{{ card(a) }}{% endfor %}</div>
       </section>
       {% endif %}
