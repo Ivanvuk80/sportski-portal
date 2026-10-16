@@ -1,4 +1,4 @@
-# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y) + P1.1(headings) + P1.2(gemini-3.5-model)
+# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y) + P1.1(headings) + P1.2(gemini-3.5-model) + P2(no-starvation) + P2.1(neon-cu-saver)
 """
 Sports News Aggregator - Single-file, self-updating build.
 
@@ -120,6 +120,14 @@ GEMINI_API_URL = (
 # Temporary Render-safe default: one translation per refresh cycle.
 # Increase only after the worker/queue architecture is in place.
 MAX_TRANSLATIONS_PER_RUN = int(os.environ.get("MAX_TRANSLATIONS_PER_RUN", "1"))
+
+# Anti-zastoj: srcevo napustanje van-delijum-prevod-carstva (queue starvation).
+# Kapija posmatra samo vesti koje SADA mogu u ciklus; one u grace-periodi
+# (next_retry_at u buducnosti) ne blokiraju fetch. Ako vest sakupi dovoljno
+# neuspeha, parkiramo je 30 dana (retry logika je i dalje vraca kad se
+# prevodi oporave) — jedna otrovana vest nikada ne sme zarobiti ceo sajt.
+PARK_AFTER_ATTEMPTS = int(os.environ.get("PARK_AFTER_ATTEMPTS", "30"))
+PARK_PARKING_SECONDS = int(os.environ.get("PARK_PARKING_SECONDS", str(30 * 86400)))
 # AUTOMATIC publishing: every successfully translated article goes live on its
 # own as a 'standard' card. Placement still follows the priority criteria
 # (Zvezda p=2 -> hero, etc.) and the admin panel ALWAYS stays available so any
@@ -261,24 +269,57 @@ class _DatabaseAdapter:
         self.connection = connection
         self.dialect = dialect
         self.dsn = dsn
+        self._last_used = time.monotonic()
 
-    def _reconnect(self):
-        try:
-            self.connection.close()
-        except Exception:
-            pass
-        self.connection = psycopg.connect(
+    _IDLE_RECYCLE = float(os.environ.get("DB_IDLE_RECYCLE_SECONDS", "45"))
+
+    def _recycle_if_idle(self) -> None:
+        """Close the shared connection after a few quiet seconds.
+
+        Free-tiers (Neon) treat an OPEN connection as activity: a 24/7 lived
+        connection keeps the compute awake and burns the full 100 CU-hours
+        monthly allowance in ~2 weeks. Closing it quickly when it goes quiet
+        lets Neon's autosuspend finally put the database to sleep between
+        cron cycles -> roughly 2x less compute spend.
+        """
+        if self.connection is None:
+            return
+        if time.monotonic() - self._last_used > self._IDLE_RECYCLE:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection = None
+
+    def _ensure(self):
+        if self.connection is None:
+            self.connection = self._connect()
+        self._last_used = time.monotonic()
+
+    def _connect(self):
+        import psycopg as _pg
+        return _pg.connect(
             self.dsn,
             row_factory=dict_row,
             connect_timeout=10,
             options=self._PG_OPTIONS,
         )
 
+    def _reconnect(self):
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+        self.connection = None
+        self._ensure()
+
     def execute(self, sql: str, params=()):
         if self.dialect != "postgres":
             return self.connection.execute(sql, params)
         # All application queries use ? placeholders. psycopg uses %s.
         sql = sql.replace("?", "%s")
+        self._recycle_if_idle()
+        self._ensure()
         try:
             return self.connection.execute(sql, params)
         except (psycopg.OperationalError, psycopg.InterfaceError):
@@ -1060,6 +1101,23 @@ def process_translations(limit: int = MAX_TRANSLATIONS_PER_RUN) -> tuple[int, in
                 time.sleep(0.5)
         except Exception as exc:
             failed += 1
+            if attempt_count >= PARK_AFTER_ATTEMPTS:
+                park_at = time.time() + PARK_PARKING_SECONDS
+                park_txt = f"parked after {attempt_count} attempts: " + str(exc).replace("\n", " ")[:440]
+                with _db_lock:
+                    _db.execute(
+                        """UPDATE articles
+                           SET translated_title='', translated_summary='',
+                               last_error=?, next_retry_at=?, status='pending'
+                           WHERE id=?""",
+                        (park_txt, park_at, article_id),
+                    )
+                    _db.commit()
+                print(
+                    f"[TRANSLATE][PARK] #{article_id}: {attempt_count}. pokusaj — "
+                    f"vest parkirana na {PARK_PARKING_SECONDS//86400} dana."
+                )
+                continue
             retry_at = time.time() + _retry_delay(attempt_count)
             error_text = str(exc).replace("\n", " ")[:500]
             with _db_lock:
@@ -2401,13 +2459,17 @@ def rucno_osvezi_vesti_iz_rama():
         ), 202
 
     try:
+        now_gate = time.time()
         with _db_lock:
             pending = _db.execute(
                 """SELECT 1 FROM articles
                    WHERE status='pending'
+                     AND is_archived = 0
                      AND translated_title = ''
                      AND translated_summary = ''
-                   LIMIT 1"""
+                     AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                   LIMIT 1""",
+                (now_gate,),
             ).fetchone()
 
         if pending:
