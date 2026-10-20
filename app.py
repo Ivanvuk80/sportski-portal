@@ -1,4 +1,4 @@
-# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y) + P1.1(headings) + P1.2(gemini-3.5-model) + P2(no-starvation) + P2.1(neon-cu-saver) + P3(v7: robots+sitemap+canonical+og+twitter+jsonld+favicon+aria+focus)
+# v2026-09-30 Arena: self-healing DB + 24h hero/trending + SA title-only + P1(security,SEO,a11y) + P1.1(headings) + P1.2(gemini-3.5-model) + P2(no-starvation) + P2.1(neon-cu-saver) + P3(v7: robots+sitemap+canonical+og+twitter+jsonld+favicon+aria+focus) + P4(v8: pretraga+iso+privatnost+share)
 """
 Sports News Aggregator - Single-file, self-updating build.
 
@@ -222,6 +222,16 @@ TRANSLATION_ERROR_MARKERS = (
 )
 
 app = Flask(__name__)
+
+
+def _iso_date(value):
+    """Normalizuje published_date u ISO-8601 za JSON-LD (v8/#5)."""
+    s = (value or "").strip()
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*(?:UTC|Z|utc))?", s)
+    return f"{m.group(1)}T{m.group(2)}Z" if m else s
+
+
+app.jinja_env.filters["iso_date"] = _iso_date
 app.secret_key = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-in-production")
 
 # --- Security headers (v2026-09-30 P1+). Svi dobijaju iste vrednosti;
@@ -1680,6 +1690,11 @@ form textarea{resize:vertical; min-height:160px;}
   .admin-list{max-height:46vh;} .admin-review{position:static;}
 }
 
+/* v8: pretraga */
+.search-bar { display:flex; gap:10px; margin:0 0 16px; }
+.search-note { color:var(--muted); margin:2px 2px 14px; font-size:15px; }
+@media (max-width:520px){ .search-bar { flex-direction:column; } }
+
 /* v7: vidljiv fokus za tastaturnu navigaciju (WCAG 2.4.7) */
 a:focus-visible, button:focus-visible, [tabindex]:focus-visible {
   outline: 3px solid var(--green);
@@ -1759,6 +1774,7 @@ PUBLIC_TEMPLATE = """
         <div class="nav-dropdown" id="navDropdown">
           <a href="{{ url_for('most_read') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128293;</span> Naj&#269;itanije</a>
           <a href="{{ url_for('archive') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128218;</span> Arhiva</a>
+          <a href="/pretraga" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128269;</span> Pretraga</a>
           <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
           <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
           <a href="{{ url_for('index') }}#tenis" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127934;</span> Tenis</a>
@@ -1772,6 +1788,17 @@ PUBLIC_TEMPLATE = """
   </header>
 
   <main class="container" id="main">
+    {% if search_q is defined %}
+    <form class="search-bar" action="/pretraga" method="get" role="search">
+      <input type="search" name="q" value="{{ search_q|e }}" minlength="2" maxlength="80" required
+             placeholder="Pretraga vesti&#8230;" aria-label="Pretraga vesti"
+             style="flex:1;min-width:0;padding:14px 18px;font-size:17px;border-radius:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);">
+      <button type="submit" style="padding:14px 22px;font-size:17px;border:0;border-radius:12px;background:var(--green);color:#052e16;font-weight:700;cursor:pointer;">Tra&#382;i</button>
+    </form>
+    {% if search_q %}<p class="search-note">Prona&#273;eno <b>{{ trending|length }}</b> rezultat{{ "" if trending|length == 1 else "a" }} za upit &bdquo;{{ search_q }}&ldquo;.</p>
+    {% if not trending %}<p class="search-note">Nema rezultata &#8212; poku&scaron;aj kra&#263;i pojam (npr. &bdquo;Zvezda&ldquo;, &bdquo;tenis&ldquo;).</p>{% endif %}
+    {% else %}<p class="search-note">Ukucaj pojam (najmanje 2 slova) &#8212; pretra&#382;ujem naslove i sa&#382;etke svih vesti.</p>{% endif %}
+    {% endif %}
     {% if hero or trending or category_sections or south_america %}
 
       {% if hero %}
@@ -1862,7 +1889,7 @@ PUBLIC_TEMPLATE = """
   </main>
 
   <footer class="container footer-text">
-    &copy; 2026 Sportski Portal. Sva prava zadr&#382;ana.
+    &copy; 2026 Sportski Portal. Sva prava zadr&#382;ana. &middot; <a href="/privatnost" style="color:inherit;text-decoration:underline;">Politika privatnosti</a>
   </footer>
 </body>
 </html>
@@ -1888,7 +1915,7 @@ ARTICLE_DETAIL_TEMPLATE = """
   {"@context":"https://schema.org","@type":"NewsArticle",
    "headline":{{ a.translated_title|tojson }},
    "description":{{ (a.translated_summary or '')|truncate(300)|tojson }},
-   "inLanguage":"sr","datePublished":"{{ a.published_date }}",
+   "inLanguage":"sr","datePublished":"{{ a.published_date|iso_date }}",
    "url":"https://sportska.onrender.com/vest/{{ a.id }}",
    "isBasedOn":"{{ a.link|e }}",
    "author":{"@type":"Organization","name":"Sportski Portal"},
@@ -1912,6 +1939,7 @@ ARTICLE_DETAIL_TEMPLATE = """
         <div class="nav-dropdown" id="navDropdown">
           <a href="{{ url_for('most_read') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128293;</span> Naj&#269;itanije</a>
           <a href="{{ url_for('archive') }}" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128218;</span> Arhiva</a>
+          <a href="/pretraga" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#128269;</span> Pretraga</a>
           <a href="{{ url_for('index') }}#fudbal" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#9917;</span> Fudbal</a>
           <a href="{{ url_for('index') }}#kosarka" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127936;</span> Ko&#353;arka</a>
           <a href="{{ url_for('index') }}#tenis" onclick="document.getElementById('navDropdown').classList.remove('show');document.getElementById('hamburgerBtn').classList.remove('open');"><span class="ico">&#127934;</span> Tenis</a>
@@ -1948,6 +1976,19 @@ ARTICLE_DETAIL_TEMPLATE = """
 
         <div class="article-body">
           {% for para in paragraphs %}<p>{{ para }}</p>{% endfor %}
+        </div>
+
+        <div class="share" role="group" aria-label="Podeli vest"
+             style="display:flex;flex-wrap:wrap;gap:10px;margin:20px 0 4px;">
+          <span style="color:var(--muted);font-size:15px;align-self:center;">Podeli vest:</span>
+          <a href="https://www.facebook.com/sharer/sharer.php?u={{ url_for('article_detail', article_id=a.id, _external=True)|urlencode }}"
+             target="_blank" rel="noopener" style="padding:10px 16px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--text);text-decoration:none;">Fejsbuk</a>
+          <a href="https://twitter.com/intent/tweet?url={{ url_for('article_detail', article_id=a.id, _external=True)|urlencode }}&text={{ a.translated_title|urlencode }}"
+             target="_blank" rel="noopener" style="padding:10px 16px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--text);text-decoration:none;">X (Tviter)</a>
+          <a href="viber://forward?text={{ ('Sportski Portal: ' ~ a.translated_title ~ ' &#8212; ' ~ url_for('article_detail', article_id=a.id, _external=True))|urlencode }}"
+             style="padding:10px 16px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--text);text-decoration:none;">Viber</a>
+          <a href="https://wa.me/?text={{ ('Sportski Portal: ' ~ a.translated_title ~ ' &#8212; ' ~ url_for('article_detail', article_id=a.id, _external=True))|urlencode }}"
+             target="_blank" rel="noopener" style="padding:10px 16px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--text);text-decoration:none;">WhatsApp</a>
         </div>
 
         <p class="source-discreet">
@@ -2464,6 +2505,74 @@ def article_detail(article_id: int):
         ARTICLE_DETAIL_TEMPLATE, a=row, paragraphs=paragraphs, css=BASE_CSS,
     )
 
+
+
+# ---------------------------------------------------------------------------
+# v8 (audit v5): pretraga + stranica privatnosti
+# ---------------------------------------------------------------------------
+SITE_CONTACT_EMAIL = os.environ.get("SITE_CONTACT_EMAIL", "")
+
+
+@app.route("/pretraga")
+def search():
+    """Pretraga objavljenih vesti po naslovu/sazetku (v8/#4)."""
+    q = (request.args.get("q") or "").strip()[:80]
+    rows = []
+    if len(q) >= 2:
+        db = get_db()
+        needle = f"%{q.lower()}%"
+        rows = db.execute(
+            "SELECT * FROM articles WHERE status = 'published' AND "
+            "(lower(translated_title) LIKE ? OR lower(translated_summary) LIKE ?) "
+            "ORDER BY id DESC LIMIT 30", (needle, needle),
+        ).fetchall()
+    return render_template_string(
+        PUBLIC_TEMPLATE, hero=None, trending=rows,
+        category_sections=[], south_america=[],
+        view_title=(f"Pretraga: {q}" if q else "Pretraga vesti"),
+        view_intro="", is_most_read=False, is_archive=False,
+        list_heading=("REZULTATI PRETRAGE" if q else "PRETRAGA VESTI"),
+        archive_category=None, archive_categories=[], archive_page=1,
+        archive_total=0, archive_total_pages=0, archive_pages=[],
+        search_q=q, css=BASE_CSS,
+    )
+
+
+PRIVACY_TEMPLATE = """<!doctype html>
+<html lang="sr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Politika privatnosti &#8211; Sportski Portal</title>
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%BD%3C/text%3E%3C/svg%3E">
+  <style>{{ css|safe }}</style>
+</head>
+<body>
+  <main class="container" style="max-width:760px">
+    <a class="back-link" href="{{ url_for('index') }}">&larr; Nazad na po&#269;etnu</a>
+    <article class="article-card"><div class="article-inner">
+      <h1 class="article-title">Politika privatnosti</h1>
+      <p class="meta article-meta"><span>Poslednja izmena: 16. oktobar 2026.</span></p>
+      <div class="article-body">
+        <p><strong>Ko smo.</strong> Sportski Portal (sportska.onrender.com) je sportski agregator vesti namenjen citaocima, pre svega iz Srbije i regiona.</p>
+        <p><strong>Licne podatke ne prikupljamo.</strong> Sajt nema korisnicke naloge, komentare ni forme za prijavu; ne trazimo i ne cuvamo ime, e-postu niti druge licne podatke posetilaca.</p>
+        <p><strong>Tehnicki logovi.</strong> Nas hosting provajder (Render) radi bezbednosti i stabilnosti usluge uobicajeno evidentira tehnicke podatke o pristupu (IP adresu, tip pregledaca, vreme), po sopstvenoj politici cuvanja (obicno do 30 dana). Pravni osnov je legitimni interes (cl. 6 st. 1 t. f Opste uredbe GDPR).</p>
+        <p><strong>Kolacici.</strong> Sajt <u>ne koristi</u> kolacice za pracenje, analiticke kolacice niti reklamne identifikatore, pa saglasnost za kolacice nije potrebna.</p>
+        <p><strong>Operatori obrade.</strong> Tehnicku infrastrukturu obezbedjuju Render (hosting) i Neon (baza podataka), iskljucivo u svrhu pruzanja usluge.</p>
+        <p><strong>Vasa prava.</strong> Po GDPR-u (cl. 12&ndash;22) i Zakonu o zastiti podataka o licnosti imate pravo na pristup, ispravku, brisanje i ogranicenje obrade, kao i na prigovor. Zalbu mozete podneti Povereniku za informacije od javnog znacaja i zastitu podataka o licnosti (Srbija) ili svom nacionalnom nadzornom telu.</p>
+        {% if contact_email %}<p><strong>Kontakt.</strong> Za pitanja o privatnosti pisi nam na <a href="mailto:{{ contact_email|e }}" style="color:var(--green)">{{ contact_email|e }}</a>.</p>{% endif %}
+      </div>
+    </div></article>
+  </main>
+</body>
+</html>"""
+
+
+@app.route("/privatnost")
+def privacy():
+    """Staticka stranica politike privatnosti (v8/#6; GDPR + ZZPL)."""
+    return render_template_string(PRIVACY_TEMPLATE, css=BASE_CSS,
+                                  contact_email=SITE_CONTACT_EMAIL)
 
 
 # ---------------------------------------------------------------------------
@@ -3893,6 +4002,7 @@ def sitemap_xml():
            f'<url><loc>{SITE_URL}/</loc><changefreq>hourly</changefreq><priority>1.0</priority></url>'
            f'<url><loc>{SITE_URL}/najcitanije</loc><changefreq>daily</changefreq><priority>0.8</priority></url>'
            f'<url><loc>{SITE_URL}/arhiva</loc><changefreq>daily</changefreq><priority>0.7</priority></url>'
+           f'<url><loc>{SITE_URL}/privatnost</loc><changefreq>yearly</changefreq><priority>0.2</priority></url>'
            f'{urls}</urlset>')
     return xml, 200, {"Content-Type": "application/xml; charset=utf-8"}
 
